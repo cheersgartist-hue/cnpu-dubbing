@@ -5,11 +5,583 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ADR 補錄音清單系統 — Cheer CN PU Dubbing</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@2.44.0/tabler-icons.min.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js">
+/* ══════════════════════════════════════════
+   IMPORT
+══════════════════════════════════════════ */
+var importData = null; // parsed preview data before confirming
+
+function openImportModal(){
+  importData = null;
+  document.getElementById('im-result').innerHTML = '';
+  document.getElementById('im-confirm').style.display = 'none';
+  document.getElementById('im-file').value = '';
+  document.getElementById('import-modal').style.display = 'flex';
+}
+function closeImportModal(){
+  document.getElementById('import-modal').style.display = 'none';
+  importData = null;
+}
+document.getElementById('import-modal').addEventListener('click', function(e){ if(e.target===this) closeImportModal(); });
+
+function onImDrop(e){
+  e.preventDefault();
+  document.getElementById('im-drop').classList.remove('dv');
+  var f = e.dataTransfer.files[0];
+  if(f) parseImport(f);
+}
+function onImFile(f){ if(f) parseImport(f); }
+
+function parseImport(file){
+  var resultDiv = document.getElementById('im-result');
+  resultDiv.innerHTML = '<p style="font-size:12px;color:var(--text3)">讀取中…</p>';
+  document.getElementById('im-confirm').style.display = 'none';
+
+  var reader = new FileReader();
+  reader.onload = function(e){
+    try {
+      var wb = XLSX.read(e.target.result, {type:'array'});
+      // Each sheet = one episode
+      // Columns: 卡號, 整體反饋, 輪次, 現場討論, 台詞修改, 台詞更改日期, Walla, Walla日期, 追加完成
+      var episodes = [];
+      var warnings = [];
+
+      wb.SheetNames.forEach(function(sheetName){
+        var ws = wb.Sheets[sheetName];
+        var rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
+        if(rows.length < 2){ warnings.push(sheetName + '：無資料，略過'); return; }
+
+        var ep = { id: uid(), name: sheetName, shots: [] };
+        var currentShot = null;
+
+        // skip header row
+        for(var i=1; i<rows.length; i++){
+          var row = rows[i];
+          var shotId = String(row[0]||'').trim().toUpperCase();
+          var feedback = String(row[1]||'').trim();
+          var roundLbl = String(row[2]||'').trim();
+          var onSite = String(row[3]||'').trim() === '是';
+          var dialogText = String(row[4]||'').trim();
+          var dialogDate = String(row[5]||'').trim();
+          var walla = String(row[6]||'').trim() === '是';
+          var wallaDate = String(row[7]||'').trim();
+          var appendDone = String(row[8]||'').trim() === '是';
+
+          if(shotId){
+            // new shot
+            currentShot = { id: uid(), shotId: shotId, feedback: feedback, rounds: [] };
+            ep.shots.push(currentShot);
+          }
+          if(currentShot && roundLbl){
+            currentShot.rounds.push({
+              id: uid(),
+              feedback: feedback,
+              dialogText: dialogText,
+              onSite: onSite,
+              dialogDate: dialogDate,
+              walla: walla,
+              wallaDate: wallaDate,
+              appendDone: appendDone
+            });
+          }
+          // ensure at least one round
+          if(currentShot && currentShot.rounds.length === 0){
+            currentShot.rounds.push(mkRound());
+          }
+        }
+        // clean up shots with no rounds
+        ep.shots = ep.shots.filter(function(s){ return s.rounds.length > 0; });
+        if(ep.shots.length > 0) episodes.push(ep);
+        else warnings.push(sheetName + '：無有效卡號，略過');
+      });
+
+      if(!episodes.length){
+        resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 找不到有效資料，請確認是本系統匯出的 Excel</div>';
+        return;
+      }
+
+      importData = episodes;
+      var html = '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">預覽（確認後將新增至現有專案）：</div>';
+      episodes.forEach(function(ep){
+        html += '<div class="im-row ok"><i class="ti ti-check"></i> ' + esc(ep.name) + ' — ' + ep.shots.length + ' 個卡號</div>';
+      });
+      warnings.forEach(function(w){
+        html += '<div class="im-row warn"><i class="ti ti-alert-triangle"></i> ' + esc(w) + '</div>';
+      });
+      html += '<div style="font-size:11px;color:var(--text3);margin-top:8px">⚠ 匯入會新增集數，不會覆蓋或刪除現有資料</div>';
+      resultDiv.innerHTML = html;
+      document.getElementById('im-confirm').style.display = 'inline-flex';
+
+    } catch(err){
+      resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 讀取失敗：' + esc(err.message) + '</div>';
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function doImport(){
+  if(!importData || !importData.length) return;
+  var p = getP();
+  if(!p){
+    // no project selected: create one named after file
+    p = { id: uid(), name: '匯入備份 ' + today(), episodes: [] };
+    DB.projects.push(p);
+  }
+  // add episodes (avoid duplicate names)
+  importData.forEach(function(ep){
+    var exists = p.episodes.find(function(e){ return e.name === ep.name; });
+    if(exists){
+      // merge shots that don't already exist
+      ep.shots.forEach(function(s){
+        if(!exists.shots.find(function(x){ return x.shotId === s.shotId; })){
+          exists.shots.push(s);
+        }
+      });
+    } else {
+      p.episodes.push(ep);
+    }
+  });
+  persist();
+  closeImportModal();
+  renderSidebar();
+  selectP(p.id);
+  alert('匯入完成！共匯入 ' + importData.length + ' 個集數');
+}
+
+</script>
 <!-- Firebase SDKs -->
-<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js">
+/* ══════════════════════════════════════════
+   IMPORT
+══════════════════════════════════════════ */
+var importData = null; // parsed preview data before confirming
+
+function openImportModal(){
+  importData = null;
+  document.getElementById('im-result').innerHTML = '';
+  document.getElementById('im-confirm').style.display = 'none';
+  document.getElementById('im-file').value = '';
+  document.getElementById('import-modal').style.display = 'flex';
+}
+function closeImportModal(){
+  document.getElementById('import-modal').style.display = 'none';
+  importData = null;
+}
+document.getElementById('import-modal').addEventListener('click', function(e){ if(e.target===this) closeImportModal(); });
+
+function onImDrop(e){
+  e.preventDefault();
+  document.getElementById('im-drop').classList.remove('dv');
+  var f = e.dataTransfer.files[0];
+  if(f) parseImport(f);
+}
+function onImFile(f){ if(f) parseImport(f); }
+
+function parseImport(file){
+  var resultDiv = document.getElementById('im-result');
+  resultDiv.innerHTML = '<p style="font-size:12px;color:var(--text3)">讀取中…</p>';
+  document.getElementById('im-confirm').style.display = 'none';
+
+  var reader = new FileReader();
+  reader.onload = function(e){
+    try {
+      var wb = XLSX.read(e.target.result, {type:'array'});
+      // Each sheet = one episode
+      // Columns: 卡號, 整體反饋, 輪次, 現場討論, 台詞修改, 台詞更改日期, Walla, Walla日期, 追加完成
+      var episodes = [];
+      var warnings = [];
+
+      wb.SheetNames.forEach(function(sheetName){
+        var ws = wb.Sheets[sheetName];
+        var rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
+        if(rows.length < 2){ warnings.push(sheetName + '：無資料，略過'); return; }
+
+        var ep = { id: uid(), name: sheetName, shots: [] };
+        var currentShot = null;
+
+        // skip header row
+        for(var i=1; i<rows.length; i++){
+          var row = rows[i];
+          var shotId = String(row[0]||'').trim().toUpperCase();
+          var feedback = String(row[1]||'').trim();
+          var roundLbl = String(row[2]||'').trim();
+          var onSite = String(row[3]||'').trim() === '是';
+          var dialogText = String(row[4]||'').trim();
+          var dialogDate = String(row[5]||'').trim();
+          var walla = String(row[6]||'').trim() === '是';
+          var wallaDate = String(row[7]||'').trim();
+          var appendDone = String(row[8]||'').trim() === '是';
+
+          if(shotId){
+            // new shot
+            currentShot = { id: uid(), shotId: shotId, feedback: feedback, rounds: [] };
+            ep.shots.push(currentShot);
+          }
+          if(currentShot && roundLbl){
+            currentShot.rounds.push({
+              id: uid(),
+              feedback: feedback,
+              dialogText: dialogText,
+              onSite: onSite,
+              dialogDate: dialogDate,
+              walla: walla,
+              wallaDate: wallaDate,
+              appendDone: appendDone
+            });
+          }
+          // ensure at least one round
+          if(currentShot && currentShot.rounds.length === 0){
+            currentShot.rounds.push(mkRound());
+          }
+        }
+        // clean up shots with no rounds
+        ep.shots = ep.shots.filter(function(s){ return s.rounds.length > 0; });
+        if(ep.shots.length > 0) episodes.push(ep);
+        else warnings.push(sheetName + '：無有效卡號，略過');
+      });
+
+      if(!episodes.length){
+        resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 找不到有效資料，請確認是本系統匯出的 Excel</div>';
+        return;
+      }
+
+      importData = episodes;
+      var html = '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">預覽（確認後將新增至現有專案）：</div>';
+      episodes.forEach(function(ep){
+        html += '<div class="im-row ok"><i class="ti ti-check"></i> ' + esc(ep.name) + ' — ' + ep.shots.length + ' 個卡號</div>';
+      });
+      warnings.forEach(function(w){
+        html += '<div class="im-row warn"><i class="ti ti-alert-triangle"></i> ' + esc(w) + '</div>';
+      });
+      html += '<div style="font-size:11px;color:var(--text3);margin-top:8px">⚠ 匯入會新增集數，不會覆蓋或刪除現有資料</div>';
+      resultDiv.innerHTML = html;
+      document.getElementById('im-confirm').style.display = 'inline-flex';
+
+    } catch(err){
+      resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 讀取失敗：' + esc(err.message) + '</div>';
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function doImport(){
+  if(!importData || !importData.length) return;
+  var p = getP();
+  if(!p){
+    // no project selected: create one named after file
+    p = { id: uid(), name: '匯入備份 ' + today(), episodes: [] };
+    DB.projects.push(p);
+  }
+  // add episodes (avoid duplicate names)
+  importData.forEach(function(ep){
+    var exists = p.episodes.find(function(e){ return e.name === ep.name; });
+    if(exists){
+      // merge shots that don't already exist
+      ep.shots.forEach(function(s){
+        if(!exists.shots.find(function(x){ return x.shotId === s.shotId; })){
+          exists.shots.push(s);
+        }
+      });
+    } else {
+      p.episodes.push(ep);
+    }
+  });
+  persist();
+  closeImportModal();
+  renderSidebar();
+  selectP(p.id);
+  alert('匯入完成！共匯入 ' + importData.length + ' 個集數');
+}
+
+</script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js">
+/* ══════════════════════════════════════════
+   IMPORT
+══════════════════════════════════════════ */
+var importData = null; // parsed preview data before confirming
+
+function openImportModal(){
+  importData = null;
+  document.getElementById('im-result').innerHTML = '';
+  document.getElementById('im-confirm').style.display = 'none';
+  document.getElementById('im-file').value = '';
+  document.getElementById('import-modal').style.display = 'flex';
+}
+function closeImportModal(){
+  document.getElementById('import-modal').style.display = 'none';
+  importData = null;
+}
+document.getElementById('import-modal').addEventListener('click', function(e){ if(e.target===this) closeImportModal(); });
+
+function onImDrop(e){
+  e.preventDefault();
+  document.getElementById('im-drop').classList.remove('dv');
+  var f = e.dataTransfer.files[0];
+  if(f) parseImport(f);
+}
+function onImFile(f){ if(f) parseImport(f); }
+
+function parseImport(file){
+  var resultDiv = document.getElementById('im-result');
+  resultDiv.innerHTML = '<p style="font-size:12px;color:var(--text3)">讀取中…</p>';
+  document.getElementById('im-confirm').style.display = 'none';
+
+  var reader = new FileReader();
+  reader.onload = function(e){
+    try {
+      var wb = XLSX.read(e.target.result, {type:'array'});
+      // Each sheet = one episode
+      // Columns: 卡號, 整體反饋, 輪次, 現場討論, 台詞修改, 台詞更改日期, Walla, Walla日期, 追加完成
+      var episodes = [];
+      var warnings = [];
+
+      wb.SheetNames.forEach(function(sheetName){
+        var ws = wb.Sheets[sheetName];
+        var rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
+        if(rows.length < 2){ warnings.push(sheetName + '：無資料，略過'); return; }
+
+        var ep = { id: uid(), name: sheetName, shots: [] };
+        var currentShot = null;
+
+        // skip header row
+        for(var i=1; i<rows.length; i++){
+          var row = rows[i];
+          var shotId = String(row[0]||'').trim().toUpperCase();
+          var feedback = String(row[1]||'').trim();
+          var roundLbl = String(row[2]||'').trim();
+          var onSite = String(row[3]||'').trim() === '是';
+          var dialogText = String(row[4]||'').trim();
+          var dialogDate = String(row[5]||'').trim();
+          var walla = String(row[6]||'').trim() === '是';
+          var wallaDate = String(row[7]||'').trim();
+          var appendDone = String(row[8]||'').trim() === '是';
+
+          if(shotId){
+            // new shot
+            currentShot = { id: uid(), shotId: shotId, feedback: feedback, rounds: [] };
+            ep.shots.push(currentShot);
+          }
+          if(currentShot && roundLbl){
+            currentShot.rounds.push({
+              id: uid(),
+              feedback: feedback,
+              dialogText: dialogText,
+              onSite: onSite,
+              dialogDate: dialogDate,
+              walla: walla,
+              wallaDate: wallaDate,
+              appendDone: appendDone
+            });
+          }
+          // ensure at least one round
+          if(currentShot && currentShot.rounds.length === 0){
+            currentShot.rounds.push(mkRound());
+          }
+        }
+        // clean up shots with no rounds
+        ep.shots = ep.shots.filter(function(s){ return s.rounds.length > 0; });
+        if(ep.shots.length > 0) episodes.push(ep);
+        else warnings.push(sheetName + '：無有效卡號，略過');
+      });
+
+      if(!episodes.length){
+        resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 找不到有效資料，請確認是本系統匯出的 Excel</div>';
+        return;
+      }
+
+      importData = episodes;
+      var html = '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">預覽（確認後將新增至現有專案）：</div>';
+      episodes.forEach(function(ep){
+        html += '<div class="im-row ok"><i class="ti ti-check"></i> ' + esc(ep.name) + ' — ' + ep.shots.length + ' 個卡號</div>';
+      });
+      warnings.forEach(function(w){
+        html += '<div class="im-row warn"><i class="ti ti-alert-triangle"></i> ' + esc(w) + '</div>';
+      });
+      html += '<div style="font-size:11px;color:var(--text3);margin-top:8px">⚠ 匯入會新增集數，不會覆蓋或刪除現有資料</div>';
+      resultDiv.innerHTML = html;
+      document.getElementById('im-confirm').style.display = 'inline-flex';
+
+    } catch(err){
+      resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 讀取失敗：' + esc(err.message) + '</div>';
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function doImport(){
+  if(!importData || !importData.length) return;
+  var p = getP();
+  if(!p){
+    // no project selected: create one named after file
+    p = { id: uid(), name: '匯入備份 ' + today(), episodes: [] };
+    DB.projects.push(p);
+  }
+  // add episodes (avoid duplicate names)
+  importData.forEach(function(ep){
+    var exists = p.episodes.find(function(e){ return e.name === ep.name; });
+    if(exists){
+      // merge shots that don't already exist
+      ep.shots.forEach(function(s){
+        if(!exists.shots.find(function(x){ return x.shotId === s.shotId; })){
+          exists.shots.push(s);
+        }
+      });
+    } else {
+      p.episodes.push(ep);
+    }
+  });
+  persist();
+  closeImportModal();
+  renderSidebar();
+  selectP(p.id);
+  alert('匯入完成！共匯入 ' + importData.length + ' 個集數');
+}
+
+</script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js">
+/* ══════════════════════════════════════════
+   IMPORT
+══════════════════════════════════════════ */
+var importData = null; // parsed preview data before confirming
+
+function openImportModal(){
+  importData = null;
+  document.getElementById('im-result').innerHTML = '';
+  document.getElementById('im-confirm').style.display = 'none';
+  document.getElementById('im-file').value = '';
+  document.getElementById('import-modal').style.display = 'flex';
+}
+function closeImportModal(){
+  document.getElementById('import-modal').style.display = 'none';
+  importData = null;
+}
+document.getElementById('import-modal').addEventListener('click', function(e){ if(e.target===this) closeImportModal(); });
+
+function onImDrop(e){
+  e.preventDefault();
+  document.getElementById('im-drop').classList.remove('dv');
+  var f = e.dataTransfer.files[0];
+  if(f) parseImport(f);
+}
+function onImFile(f){ if(f) parseImport(f); }
+
+function parseImport(file){
+  var resultDiv = document.getElementById('im-result');
+  resultDiv.innerHTML = '<p style="font-size:12px;color:var(--text3)">讀取中…</p>';
+  document.getElementById('im-confirm').style.display = 'none';
+
+  var reader = new FileReader();
+  reader.onload = function(e){
+    try {
+      var wb = XLSX.read(e.target.result, {type:'array'});
+      // Each sheet = one episode
+      // Columns: 卡號, 整體反饋, 輪次, 現場討論, 台詞修改, 台詞更改日期, Walla, Walla日期, 追加完成
+      var episodes = [];
+      var warnings = [];
+
+      wb.SheetNames.forEach(function(sheetName){
+        var ws = wb.Sheets[sheetName];
+        var rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
+        if(rows.length < 2){ warnings.push(sheetName + '：無資料，略過'); return; }
+
+        var ep = { id: uid(), name: sheetName, shots: [] };
+        var currentShot = null;
+
+        // skip header row
+        for(var i=1; i<rows.length; i++){
+          var row = rows[i];
+          var shotId = String(row[0]||'').trim().toUpperCase();
+          var feedback = String(row[1]||'').trim();
+          var roundLbl = String(row[2]||'').trim();
+          var onSite = String(row[3]||'').trim() === '是';
+          var dialogText = String(row[4]||'').trim();
+          var dialogDate = String(row[5]||'').trim();
+          var walla = String(row[6]||'').trim() === '是';
+          var wallaDate = String(row[7]||'').trim();
+          var appendDone = String(row[8]||'').trim() === '是';
+
+          if(shotId){
+            // new shot
+            currentShot = { id: uid(), shotId: shotId, feedback: feedback, rounds: [] };
+            ep.shots.push(currentShot);
+          }
+          if(currentShot && roundLbl){
+            currentShot.rounds.push({
+              id: uid(),
+              feedback: feedback,
+              dialogText: dialogText,
+              onSite: onSite,
+              dialogDate: dialogDate,
+              walla: walla,
+              wallaDate: wallaDate,
+              appendDone: appendDone
+            });
+          }
+          // ensure at least one round
+          if(currentShot && currentShot.rounds.length === 0){
+            currentShot.rounds.push(mkRound());
+          }
+        }
+        // clean up shots with no rounds
+        ep.shots = ep.shots.filter(function(s){ return s.rounds.length > 0; });
+        if(ep.shots.length > 0) episodes.push(ep);
+        else warnings.push(sheetName + '：無有效卡號，略過');
+      });
+
+      if(!episodes.length){
+        resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 找不到有效資料，請確認是本系統匯出的 Excel</div>';
+        return;
+      }
+
+      importData = episodes;
+      var html = '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">預覽（確認後將新增至現有專案）：</div>';
+      episodes.forEach(function(ep){
+        html += '<div class="im-row ok"><i class="ti ti-check"></i> ' + esc(ep.name) + ' — ' + ep.shots.length + ' 個卡號</div>';
+      });
+      warnings.forEach(function(w){
+        html += '<div class="im-row warn"><i class="ti ti-alert-triangle"></i> ' + esc(w) + '</div>';
+      });
+      html += '<div style="font-size:11px;color:var(--text3);margin-top:8px">⚠ 匯入會新增集數，不會覆蓋或刪除現有資料</div>';
+      resultDiv.innerHTML = html;
+      document.getElementById('im-confirm').style.display = 'inline-flex';
+
+    } catch(err){
+      resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 讀取失敗：' + esc(err.message) + '</div>';
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function doImport(){
+  if(!importData || !importData.length) return;
+  var p = getP();
+  if(!p){
+    // no project selected: create one named after file
+    p = { id: uid(), name: '匯入備份 ' + today(), episodes: [] };
+    DB.projects.push(p);
+  }
+  // add episodes (avoid duplicate names)
+  importData.forEach(function(ep){
+    var exists = p.episodes.find(function(e){ return e.name === ep.name; });
+    if(exists){
+      // merge shots that don't already exist
+      ep.shots.forEach(function(s){
+        if(!exists.shots.find(function(x){ return x.shotId === s.shotId; })){
+          exists.shots.push(s);
+        }
+      });
+    } else {
+      p.episodes.push(ep);
+    }
+  });
+  persist();
+  closeImportModal();
+  renderSidebar();
+  selectP(p.id);
+  alert('匯入完成！共匯入 ' + importData.length + ' 個集數');
+}
+
+</script>
 <style>
 :root{
   --bg:#0f1117;--bg2:#181c27;--bg3:#1e2235;--bg4:#252a3e;
@@ -64,6 +636,17 @@ body{background:var(--bg);color:var(--text);min-height:100vh;font-size:14px}
 .sf{padding:10px 8px;border-top:1px solid var(--border)}
 .btn-ex{width:100%;padding:9px;background:var(--accent);border:none;border-radius:var(--r);color:#fff;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px}
 .btn-ex:hover{opacity:.85}
+.btn-im{width:100%;padding:9px;background:none;border:1px solid var(--border2);border-radius:var(--r);color:var(--text2);font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;margin-top:6px}
+.btn-im:hover{border-color:var(--green);color:var(--green);background:rgba(78,204,138,.06)}
+/* import modal */
+.im-drop{border:2px dashed var(--border2);border-radius:var(--rl);padding:20px;text-align:center;cursor:pointer;transition:all .2s;background:var(--bg)}
+.im-drop:hover,.im-drop.dv{border-color:var(--green);background:rgba(78,204,138,.05)}
+.im-drop i{font-size:28px;color:var(--text3);display:block;margin-bottom:7px}
+.im-result{margin-top:12px;max-height:200px;overflow-y:auto}
+.im-row{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:5px;font-size:12px;margin-bottom:3px}
+.im-row.ok{background:rgba(78,204,138,.08);color:var(--green)}
+.im-row.warn{background:rgba(245,200,66,.08);color:var(--gold)}
+.im-row.err{background:rgba(255,92,92,.08);color:var(--red)}
 #topbar{padding:14px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;background:var(--bg2);flex-shrink:0;flex-wrap:wrap}
 #topbar h1{font-size:16px;font-weight:600;white-space:nowrap}
 .ep-tabs{display:flex;gap:5px;overflow-x:auto;flex:1}
@@ -164,6 +747,28 @@ textarea.ci::placeholder{color:var(--text3)}
 </div>
 
 
+<!-- IMPORT MODAL -->
+<div class="mo" id="import-modal" style="display:none">
+  <div class="md" onclick="event.stopPropagation()" style="max-width:520px">
+    <h2 style="margin-bottom:4px"><i class="ti ti-file-upload" style="color:var(--green)"></i> 匯入 Excel 備份</h2>
+    <p style="font-size:12px;color:var(--text3);margin-bottom:14px">選擇之前匯出的 Excel 檔案，系統將自動還原專案資料</p>
+    <div class="im-drop" id="im-drop" onclick="document.getElementById('im-file').click()"
+      ondragover="event.preventDefault();this.classList.add('dv')"
+      ondragleave="this.classList.remove('dv')"
+      ondrop="onImDrop(event)">
+      <i class="ti ti-table-import"></i>
+      <p style="font-size:13px;color:var(--text2)">拖曳 Excel 檔案至此 / 點擊選擇</p>
+      <small style="font-size:11px;color:var(--text3)">支援 .xlsx 格式（由本系統匯出的備份）</small>
+    </div>
+    <input type="file" id="im-file" accept=".xlsx" style="display:none" onchange="onImFile(this.files[0])">
+    <div class="im-result" id="im-result"></div>
+    <div class="mb" style="margin-top:14px">
+      <button class="bcl" onclick="closeImportModal()">取消</button>
+      <button class="bco" id="im-confirm" style="display:none;background:var(--green)" onclick="doImport()">確認匯入</button>
+    </div>
+  </div>
+</div>
+
 <!-- EXPORT MODAL -->
 <div class="mo" id="export-modal" style="display:none">
   <div class="md" onclick="event.stopPropagation()" style="max-width:480px">
@@ -202,6 +807,7 @@ textarea.ci::placeholder{color:var(--text3)}
     <button class="btn-ap" onclick="addProject()"><i class="ti ti-plus"></i>新增專案</button>
     <div class="sf">
       <button class="btn-ex" onclick="openExportModal('all')"><i class="ti ti-file-spreadsheet"></i>匯出全部 Excel</button>
+      <button class="btn-im" onclick="openImportModal()"><i class="ti ti-file-upload"></i>匯入 Excel 備份</button>
     </div>
   </div>
   <div id="main">
@@ -333,15 +939,29 @@ function showNoProj(){
 function doGoogleLogin(){
   var btn=document.getElementById('btn-google');
   var err=document.getElementById('login-err');
-  btn.disabled=true; err.textContent='';
+  btn.disabled=true;
+  btn.innerHTML='<i class="ti ti-loader-2" style="animation:spin 1s linear infinite;display:inline-block"></i> 跳轉中…';
+  err.textContent='';
   var provider = new firebase.auth.GoogleAuthProvider();
-  auth.signInWithPopup(provider).catch(function(e){
+  // Use redirect instead of popup for GitHub Pages compatibility
+  auth.signInWithRedirect(provider).catch(function(e){
     btn.disabled=false;
-    err.textContent = e.code==='auth/popup-closed-by-user' ? '視窗被關閉，請再試一次'
-      : e.code==='auth/popup-blocked' ? '彈出視窗被瀏覽器封鎖，請允許後再試'
-      : e.message;
+    btn.innerHTML='<svg viewBox="0 0 48 48" style="width:20px;height:20px;flex-shrink:0"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/><path fill="none" d="M0 0h48v48H0z"/></svg> 使用 Google 帳號登入';
+    err.textContent = e.message;
   });
 }
+
+// Handle redirect result on page load
+auth.getRedirectResult().then(function(result){
+  // result handled by onAuthStateChanged
+}).catch(function(e){
+  if(e.code && e.code !== 'auth/no-current-user'){
+    var err=document.getElementById('login-err');
+    if(err) err.textContent=e.message;
+    var btn=document.getElementById('btn-google');
+    if(btn) btn.disabled=false;
+  }
+});
 
 auth.onAuthStateChanged(function(user){
   var btn=document.getElementById('btn-google');
@@ -711,6 +1331,149 @@ function runExportAll(appendOnly){
   });
   XLSX.writeFile(wb,p.name+suffix+'.xlsx');
 }
+
+/* ══════════════════════════════════════════
+   IMPORT
+══════════════════════════════════════════ */
+var importData = null; // parsed preview data before confirming
+
+function openImportModal(){
+  importData = null;
+  document.getElementById('im-result').innerHTML = '';
+  document.getElementById('im-confirm').style.display = 'none';
+  document.getElementById('im-file').value = '';
+  document.getElementById('import-modal').style.display = 'flex';
+}
+function closeImportModal(){
+  document.getElementById('import-modal').style.display = 'none';
+  importData = null;
+}
+document.getElementById('import-modal').addEventListener('click', function(e){ if(e.target===this) closeImportModal(); });
+
+function onImDrop(e){
+  e.preventDefault();
+  document.getElementById('im-drop').classList.remove('dv');
+  var f = e.dataTransfer.files[0];
+  if(f) parseImport(f);
+}
+function onImFile(f){ if(f) parseImport(f); }
+
+function parseImport(file){
+  var resultDiv = document.getElementById('im-result');
+  resultDiv.innerHTML = '<p style="font-size:12px;color:var(--text3)">讀取中…</p>';
+  document.getElementById('im-confirm').style.display = 'none';
+
+  var reader = new FileReader();
+  reader.onload = function(e){
+    try {
+      var wb = XLSX.read(e.target.result, {type:'array'});
+      // Each sheet = one episode
+      // Columns: 卡號, 整體反饋, 輪次, 現場討論, 台詞修改, 台詞更改日期, Walla, Walla日期, 追加完成
+      var episodes = [];
+      var warnings = [];
+
+      wb.SheetNames.forEach(function(sheetName){
+        var ws = wb.Sheets[sheetName];
+        var rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
+        if(rows.length < 2){ warnings.push(sheetName + '：無資料，略過'); return; }
+
+        var ep = { id: uid(), name: sheetName, shots: [] };
+        var currentShot = null;
+
+        // skip header row
+        for(var i=1; i<rows.length; i++){
+          var row = rows[i];
+          var shotId = String(row[0]||'').trim().toUpperCase();
+          var feedback = String(row[1]||'').trim();
+          var roundLbl = String(row[2]||'').trim();
+          var onSite = String(row[3]||'').trim() === '是';
+          var dialogText = String(row[4]||'').trim();
+          var dialogDate = String(row[5]||'').trim();
+          var walla = String(row[6]||'').trim() === '是';
+          var wallaDate = String(row[7]||'').trim();
+          var appendDone = String(row[8]||'').trim() === '是';
+
+          if(shotId){
+            // new shot
+            currentShot = { id: uid(), shotId: shotId, feedback: feedback, rounds: [] };
+            ep.shots.push(currentShot);
+          }
+          if(currentShot && roundLbl){
+            currentShot.rounds.push({
+              id: uid(),
+              feedback: feedback,
+              dialogText: dialogText,
+              onSite: onSite,
+              dialogDate: dialogDate,
+              walla: walla,
+              wallaDate: wallaDate,
+              appendDone: appendDone
+            });
+          }
+          // ensure at least one round
+          if(currentShot && currentShot.rounds.length === 0){
+            currentShot.rounds.push(mkRound());
+          }
+        }
+        // clean up shots with no rounds
+        ep.shots = ep.shots.filter(function(s){ return s.rounds.length > 0; });
+        if(ep.shots.length > 0) episodes.push(ep);
+        else warnings.push(sheetName + '：無有效卡號，略過');
+      });
+
+      if(!episodes.length){
+        resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 找不到有效資料，請確認是本系統匯出的 Excel</div>';
+        return;
+      }
+
+      importData = episodes;
+      var html = '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">預覽（確認後將新增至現有專案）：</div>';
+      episodes.forEach(function(ep){
+        html += '<div class="im-row ok"><i class="ti ti-check"></i> ' + esc(ep.name) + ' — ' + ep.shots.length + ' 個卡號</div>';
+      });
+      warnings.forEach(function(w){
+        html += '<div class="im-row warn"><i class="ti ti-alert-triangle"></i> ' + esc(w) + '</div>';
+      });
+      html += '<div style="font-size:11px;color:var(--text3);margin-top:8px">⚠ 匯入會新增集數，不會覆蓋或刪除現有資料</div>';
+      resultDiv.innerHTML = html;
+      document.getElementById('im-confirm').style.display = 'inline-flex';
+
+    } catch(err){
+      resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 讀取失敗：' + esc(err.message) + '</div>';
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function doImport(){
+  if(!importData || !importData.length) return;
+  var p = getP();
+  if(!p){
+    // no project selected: create one named after file
+    p = { id: uid(), name: '匯入備份 ' + today(), episodes: [] };
+    DB.projects.push(p);
+  }
+  // add episodes (avoid duplicate names)
+  importData.forEach(function(ep){
+    var exists = p.episodes.find(function(e){ return e.name === ep.name; });
+    if(exists){
+      // merge shots that don't already exist
+      ep.shots.forEach(function(s){
+        if(!exists.shots.find(function(x){ return x.shotId === s.shotId; })){
+          exists.shots.push(s);
+        }
+      });
+    } else {
+      p.episodes.push(ep);
+    }
+  });
+  persist();
+  closeImportModal();
+  renderSidebar();
+  selectP(p.id);
+  alert('匯入完成！共匯入 ' + importData.length + ' 個集數');
+}
+
 </script>
 </body>
 </html>
