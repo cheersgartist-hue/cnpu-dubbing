@@ -3,585 +3,12 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ADR 補錄音清單系統 — Cheer CN PU Dubbing</title>
+<title>ADR 補錄音清單系統</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@2.44.0/tabler-icons.min.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js">
-/* ══════════════════════════════════════════
-   IMPORT
-══════════════════════════════════════════ */
-var importData = null; // parsed preview data before confirming
-
-function openImportModal(){
-  importData = null;
-  document.getElementById('im-result').innerHTML = '';
-  document.getElementById('im-confirm').style.display = 'none';
-  document.getElementById('im-file').value = '';
-  document.getElementById('import-modal').style.display = 'flex';
-}
-function closeImportModal(){
-  document.getElementById('import-modal').style.display = 'none';
-  importData = null;
-}
-document.getElementById('import-modal').addEventListener('click', function(e){ if(e.target===this) closeImportModal(); });
-
-function onImDrop(e){
-  e.preventDefault();
-  document.getElementById('im-drop').classList.remove('dv');
-  var f = e.dataTransfer.files[0];
-  if(f) parseImport(f);
-}
-function onImFile(f){ if(f) parseImport(f); }
-
-function parseImport(file){
-  var resultDiv = document.getElementById('im-result');
-  resultDiv.innerHTML = '<p style="font-size:12px;color:var(--text3)">讀取中…</p>';
-  document.getElementById('im-confirm').style.display = 'none';
-
-  var reader = new FileReader();
-  reader.onload = function(e){
-    try {
-      var wb = XLSX.read(e.target.result, {type:'array'});
-      // Each sheet = one episode
-      // Columns: 卡號, 整體反饋, 輪次, 現場討論, 台詞修改, 台詞更改日期, Walla, Walla日期, 追加完成
-      var episodes = [];
-      var warnings = [];
-
-      wb.SheetNames.forEach(function(sheetName){
-        var ws = wb.Sheets[sheetName];
-        var rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
-        if(rows.length < 2){ warnings.push(sheetName + '：無資料，略過'); return; }
-
-        var ep = { id: uid(), name: sheetName, shots: [] };
-        var currentShot = null;
-
-        // skip header row
-        for(var i=1; i<rows.length; i++){
-          var row = rows[i];
-          var shotId = String(row[0]||'').trim().toUpperCase();
-          var feedback = String(row[1]||'').trim();
-          var roundLbl = String(row[2]||'').trim();
-          var onSite = String(row[3]||'').trim() === '是';
-          var dialogText = String(row[4]||'').trim();
-          var dialogDate = String(row[5]||'').trim();
-          var walla = String(row[6]||'').trim() === '是';
-          var wallaDate = String(row[7]||'').trim();
-          var appendDone = String(row[8]||'').trim() === '是';
-
-          if(shotId){
-            // new shot
-            currentShot = { id: uid(), shotId: shotId, feedback: feedback, rounds: [] };
-            ep.shots.push(currentShot);
-          }
-          if(currentShot && roundLbl){
-            currentShot.rounds.push({
-              id: uid(),
-              feedback: feedback,
-              dialogText: dialogText,
-              onSite: onSite,
-              dialogDate: dialogDate,
-              walla: walla,
-              wallaDate: wallaDate,
-              appendDone: appendDone
-            });
-          }
-          // ensure at least one round
-          if(currentShot && currentShot.rounds.length === 0){
-            currentShot.rounds.push(mkRound());
-          }
-        }
-        // clean up shots with no rounds
-        ep.shots = ep.shots.filter(function(s){ return s.rounds.length > 0; });
-        if(ep.shots.length > 0) episodes.push(ep);
-        else warnings.push(sheetName + '：無有效卡號，略過');
-      });
-
-      if(!episodes.length){
-        resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 找不到有效資料，請確認是本系統匯出的 Excel</div>';
-        return;
-      }
-
-      importData = episodes;
-      var html = '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">預覽（確認後將新增至現有專案）：</div>';
-      episodes.forEach(function(ep){
-        html += '<div class="im-row ok"><i class="ti ti-check"></i> ' + esc(ep.name) + ' — ' + ep.shots.length + ' 個卡號</div>';
-      });
-      warnings.forEach(function(w){
-        html += '<div class="im-row warn"><i class="ti ti-alert-triangle"></i> ' + esc(w) + '</div>';
-      });
-      html += '<div style="font-size:11px;color:var(--text3);margin-top:8px">⚠ 匯入會新增集數，不會覆蓋或刪除現有資料</div>';
-      resultDiv.innerHTML = html;
-      document.getElementById('im-confirm').style.display = 'inline-flex';
-
-    } catch(err){
-      resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 讀取失敗：' + esc(err.message) + '</div>';
-    }
-  };
-  reader.readAsArrayBuffer(file);
-}
-
-function doImport(){
-  if(!importData || !importData.length) return;
-  var p = getP();
-  if(!p){
-    // no project selected: create one named after file
-    p = { id: uid(), name: '匯入備份 ' + today(), episodes: [] };
-    DB.projects.push(p);
-  }
-  // add episodes (avoid duplicate names)
-  importData.forEach(function(ep){
-    var exists = p.episodes.find(function(e){ return e.name === ep.name; });
-    if(exists){
-      // merge shots that don't already exist
-      ep.shots.forEach(function(s){
-        if(!exists.shots.find(function(x){ return x.shotId === s.shotId; })){
-          exists.shots.push(s);
-        }
-      });
-    } else {
-      p.episodes.push(ep);
-    }
-  });
-  persist();
-  closeImportModal();
-  renderSidebar();
-  selectP(p.id);
-  alert('匯入完成！共匯入 ' + importData.length + ' 個集數');
-}
-
-</script>
-<!-- Firebase SDKs -->
-<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js">
-/* ══════════════════════════════════════════
-   IMPORT
-══════════════════════════════════════════ */
-var importData = null; // parsed preview data before confirming
-
-function openImportModal(){
-  importData = null;
-  document.getElementById('im-result').innerHTML = '';
-  document.getElementById('im-confirm').style.display = 'none';
-  document.getElementById('im-file').value = '';
-  document.getElementById('import-modal').style.display = 'flex';
-}
-function closeImportModal(){
-  document.getElementById('import-modal').style.display = 'none';
-  importData = null;
-}
-document.getElementById('import-modal').addEventListener('click', function(e){ if(e.target===this) closeImportModal(); });
-
-function onImDrop(e){
-  e.preventDefault();
-  document.getElementById('im-drop').classList.remove('dv');
-  var f = e.dataTransfer.files[0];
-  if(f) parseImport(f);
-}
-function onImFile(f){ if(f) parseImport(f); }
-
-function parseImport(file){
-  var resultDiv = document.getElementById('im-result');
-  resultDiv.innerHTML = '<p style="font-size:12px;color:var(--text3)">讀取中…</p>';
-  document.getElementById('im-confirm').style.display = 'none';
-
-  var reader = new FileReader();
-  reader.onload = function(e){
-    try {
-      var wb = XLSX.read(e.target.result, {type:'array'});
-      // Each sheet = one episode
-      // Columns: 卡號, 整體反饋, 輪次, 現場討論, 台詞修改, 台詞更改日期, Walla, Walla日期, 追加完成
-      var episodes = [];
-      var warnings = [];
-
-      wb.SheetNames.forEach(function(sheetName){
-        var ws = wb.Sheets[sheetName];
-        var rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
-        if(rows.length < 2){ warnings.push(sheetName + '：無資料，略過'); return; }
-
-        var ep = { id: uid(), name: sheetName, shots: [] };
-        var currentShot = null;
-
-        // skip header row
-        for(var i=1; i<rows.length; i++){
-          var row = rows[i];
-          var shotId = String(row[0]||'').trim().toUpperCase();
-          var feedback = String(row[1]||'').trim();
-          var roundLbl = String(row[2]||'').trim();
-          var onSite = String(row[3]||'').trim() === '是';
-          var dialogText = String(row[4]||'').trim();
-          var dialogDate = String(row[5]||'').trim();
-          var walla = String(row[6]||'').trim() === '是';
-          var wallaDate = String(row[7]||'').trim();
-          var appendDone = String(row[8]||'').trim() === '是';
-
-          if(shotId){
-            // new shot
-            currentShot = { id: uid(), shotId: shotId, feedback: feedback, rounds: [] };
-            ep.shots.push(currentShot);
-          }
-          if(currentShot && roundLbl){
-            currentShot.rounds.push({
-              id: uid(),
-              feedback: feedback,
-              dialogText: dialogText,
-              onSite: onSite,
-              dialogDate: dialogDate,
-              walla: walla,
-              wallaDate: wallaDate,
-              appendDone: appendDone
-            });
-          }
-          // ensure at least one round
-          if(currentShot && currentShot.rounds.length === 0){
-            currentShot.rounds.push(mkRound());
-          }
-        }
-        // clean up shots with no rounds
-        ep.shots = ep.shots.filter(function(s){ return s.rounds.length > 0; });
-        if(ep.shots.length > 0) episodes.push(ep);
-        else warnings.push(sheetName + '：無有效卡號，略過');
-      });
-
-      if(!episodes.length){
-        resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 找不到有效資料，請確認是本系統匯出的 Excel</div>';
-        return;
-      }
-
-      importData = episodes;
-      var html = '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">預覽（確認後將新增至現有專案）：</div>';
-      episodes.forEach(function(ep){
-        html += '<div class="im-row ok"><i class="ti ti-check"></i> ' + esc(ep.name) + ' — ' + ep.shots.length + ' 個卡號</div>';
-      });
-      warnings.forEach(function(w){
-        html += '<div class="im-row warn"><i class="ti ti-alert-triangle"></i> ' + esc(w) + '</div>';
-      });
-      html += '<div style="font-size:11px;color:var(--text3);margin-top:8px">⚠ 匯入會新增集數，不會覆蓋或刪除現有資料</div>';
-      resultDiv.innerHTML = html;
-      document.getElementById('im-confirm').style.display = 'inline-flex';
-
-    } catch(err){
-      resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 讀取失敗：' + esc(err.message) + '</div>';
-    }
-  };
-  reader.readAsArrayBuffer(file);
-}
-
-function doImport(){
-  if(!importData || !importData.length) return;
-  var p = getP();
-  if(!p){
-    // no project selected: create one named after file
-    p = { id: uid(), name: '匯入備份 ' + today(), episodes: [] };
-    DB.projects.push(p);
-  }
-  // add episodes (avoid duplicate names)
-  importData.forEach(function(ep){
-    var exists = p.episodes.find(function(e){ return e.name === ep.name; });
-    if(exists){
-      // merge shots that don't already exist
-      ep.shots.forEach(function(s){
-        if(!exists.shots.find(function(x){ return x.shotId === s.shotId; })){
-          exists.shots.push(s);
-        }
-      });
-    } else {
-      p.episodes.push(ep);
-    }
-  });
-  persist();
-  closeImportModal();
-  renderSidebar();
-  selectP(p.id);
-  alert('匯入完成！共匯入 ' + importData.length + ' 個集數');
-}
-
-</script>
-<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js">
-/* ══════════════════════════════════════════
-   IMPORT
-══════════════════════════════════════════ */
-var importData = null; // parsed preview data before confirming
-
-function openImportModal(){
-  importData = null;
-  document.getElementById('im-result').innerHTML = '';
-  document.getElementById('im-confirm').style.display = 'none';
-  document.getElementById('im-file').value = '';
-  document.getElementById('import-modal').style.display = 'flex';
-}
-function closeImportModal(){
-  document.getElementById('import-modal').style.display = 'none';
-  importData = null;
-}
-document.getElementById('import-modal').addEventListener('click', function(e){ if(e.target===this) closeImportModal(); });
-
-function onImDrop(e){
-  e.preventDefault();
-  document.getElementById('im-drop').classList.remove('dv');
-  var f = e.dataTransfer.files[0];
-  if(f) parseImport(f);
-}
-function onImFile(f){ if(f) parseImport(f); }
-
-function parseImport(file){
-  var resultDiv = document.getElementById('im-result');
-  resultDiv.innerHTML = '<p style="font-size:12px;color:var(--text3)">讀取中…</p>';
-  document.getElementById('im-confirm').style.display = 'none';
-
-  var reader = new FileReader();
-  reader.onload = function(e){
-    try {
-      var wb = XLSX.read(e.target.result, {type:'array'});
-      // Each sheet = one episode
-      // Columns: 卡號, 整體反饋, 輪次, 現場討論, 台詞修改, 台詞更改日期, Walla, Walla日期, 追加完成
-      var episodes = [];
-      var warnings = [];
-
-      wb.SheetNames.forEach(function(sheetName){
-        var ws = wb.Sheets[sheetName];
-        var rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
-        if(rows.length < 2){ warnings.push(sheetName + '：無資料，略過'); return; }
-
-        var ep = { id: uid(), name: sheetName, shots: [] };
-        var currentShot = null;
-
-        // skip header row
-        for(var i=1; i<rows.length; i++){
-          var row = rows[i];
-          var shotId = String(row[0]||'').trim().toUpperCase();
-          var feedback = String(row[1]||'').trim();
-          var roundLbl = String(row[2]||'').trim();
-          var onSite = String(row[3]||'').trim() === '是';
-          var dialogText = String(row[4]||'').trim();
-          var dialogDate = String(row[5]||'').trim();
-          var walla = String(row[6]||'').trim() === '是';
-          var wallaDate = String(row[7]||'').trim();
-          var appendDone = String(row[8]||'').trim() === '是';
-
-          if(shotId){
-            // new shot
-            currentShot = { id: uid(), shotId: shotId, feedback: feedback, rounds: [] };
-            ep.shots.push(currentShot);
-          }
-          if(currentShot && roundLbl){
-            currentShot.rounds.push({
-              id: uid(),
-              feedback: feedback,
-              dialogText: dialogText,
-              onSite: onSite,
-              dialogDate: dialogDate,
-              walla: walla,
-              wallaDate: wallaDate,
-              appendDone: appendDone
-            });
-          }
-          // ensure at least one round
-          if(currentShot && currentShot.rounds.length === 0){
-            currentShot.rounds.push(mkRound());
-          }
-        }
-        // clean up shots with no rounds
-        ep.shots = ep.shots.filter(function(s){ return s.rounds.length > 0; });
-        if(ep.shots.length > 0) episodes.push(ep);
-        else warnings.push(sheetName + '：無有效卡號，略過');
-      });
-
-      if(!episodes.length){
-        resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 找不到有效資料，請確認是本系統匯出的 Excel</div>';
-        return;
-      }
-
-      importData = episodes;
-      var html = '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">預覽（確認後將新增至現有專案）：</div>';
-      episodes.forEach(function(ep){
-        html += '<div class="im-row ok"><i class="ti ti-check"></i> ' + esc(ep.name) + ' — ' + ep.shots.length + ' 個卡號</div>';
-      });
-      warnings.forEach(function(w){
-        html += '<div class="im-row warn"><i class="ti ti-alert-triangle"></i> ' + esc(w) + '</div>';
-      });
-      html += '<div style="font-size:11px;color:var(--text3);margin-top:8px">⚠ 匯入會新增集數，不會覆蓋或刪除現有資料</div>';
-      resultDiv.innerHTML = html;
-      document.getElementById('im-confirm').style.display = 'inline-flex';
-
-    } catch(err){
-      resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 讀取失敗：' + esc(err.message) + '</div>';
-    }
-  };
-  reader.readAsArrayBuffer(file);
-}
-
-function doImport(){
-  if(!importData || !importData.length) return;
-  var p = getP();
-  if(!p){
-    // no project selected: create one named after file
-    p = { id: uid(), name: '匯入備份 ' + today(), episodes: [] };
-    DB.projects.push(p);
-  }
-  // add episodes (avoid duplicate names)
-  importData.forEach(function(ep){
-    var exists = p.episodes.find(function(e){ return e.name === ep.name; });
-    if(exists){
-      // merge shots that don't already exist
-      ep.shots.forEach(function(s){
-        if(!exists.shots.find(function(x){ return x.shotId === s.shotId; })){
-          exists.shots.push(s);
-        }
-      });
-    } else {
-      p.episodes.push(ep);
-    }
-  });
-  persist();
-  closeImportModal();
-  renderSidebar();
-  selectP(p.id);
-  alert('匯入完成！共匯入 ' + importData.length + ' 個集數');
-}
-
-</script>
-<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js">
-/* ══════════════════════════════════════════
-   IMPORT
-══════════════════════════════════════════ */
-var importData = null; // parsed preview data before confirming
-
-function openImportModal(){
-  importData = null;
-  document.getElementById('im-result').innerHTML = '';
-  document.getElementById('im-confirm').style.display = 'none';
-  document.getElementById('im-file').value = '';
-  document.getElementById('import-modal').style.display = 'flex';
-}
-function closeImportModal(){
-  document.getElementById('import-modal').style.display = 'none';
-  importData = null;
-}
-document.getElementById('import-modal').addEventListener('click', function(e){ if(e.target===this) closeImportModal(); });
-
-function onImDrop(e){
-  e.preventDefault();
-  document.getElementById('im-drop').classList.remove('dv');
-  var f = e.dataTransfer.files[0];
-  if(f) parseImport(f);
-}
-function onImFile(f){ if(f) parseImport(f); }
-
-function parseImport(file){
-  var resultDiv = document.getElementById('im-result');
-  resultDiv.innerHTML = '<p style="font-size:12px;color:var(--text3)">讀取中…</p>';
-  document.getElementById('im-confirm').style.display = 'none';
-
-  var reader = new FileReader();
-  reader.onload = function(e){
-    try {
-      var wb = XLSX.read(e.target.result, {type:'array'});
-      // Each sheet = one episode
-      // Columns: 卡號, 整體反饋, 輪次, 現場討論, 台詞修改, 台詞更改日期, Walla, Walla日期, 追加完成
-      var episodes = [];
-      var warnings = [];
-
-      wb.SheetNames.forEach(function(sheetName){
-        var ws = wb.Sheets[sheetName];
-        var rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
-        if(rows.length < 2){ warnings.push(sheetName + '：無資料，略過'); return; }
-
-        var ep = { id: uid(), name: sheetName, shots: [] };
-        var currentShot = null;
-
-        // skip header row
-        for(var i=1; i<rows.length; i++){
-          var row = rows[i];
-          var shotId = String(row[0]||'').trim().toUpperCase();
-          var feedback = String(row[1]||'').trim();
-          var roundLbl = String(row[2]||'').trim();
-          var onSite = String(row[3]||'').trim() === '是';
-          var dialogText = String(row[4]||'').trim();
-          var dialogDate = String(row[5]||'').trim();
-          var walla = String(row[6]||'').trim() === '是';
-          var wallaDate = String(row[7]||'').trim();
-          var appendDone = String(row[8]||'').trim() === '是';
-
-          if(shotId){
-            // new shot
-            currentShot = { id: uid(), shotId: shotId, feedback: feedback, rounds: [] };
-            ep.shots.push(currentShot);
-          }
-          if(currentShot && roundLbl){
-            currentShot.rounds.push({
-              id: uid(),
-              feedback: feedback,
-              dialogText: dialogText,
-              onSite: onSite,
-              dialogDate: dialogDate,
-              walla: walla,
-              wallaDate: wallaDate,
-              appendDone: appendDone
-            });
-          }
-          // ensure at least one round
-          if(currentShot && currentShot.rounds.length === 0){
-            currentShot.rounds.push(mkRound());
-          }
-        }
-        // clean up shots with no rounds
-        ep.shots = ep.shots.filter(function(s){ return s.rounds.length > 0; });
-        if(ep.shots.length > 0) episodes.push(ep);
-        else warnings.push(sheetName + '：無有效卡號，略過');
-      });
-
-      if(!episodes.length){
-        resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 找不到有效資料，請確認是本系統匯出的 Excel</div>';
-        return;
-      }
-
-      importData = episodes;
-      var html = '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">預覽（確認後將新增至現有專案）：</div>';
-      episodes.forEach(function(ep){
-        html += '<div class="im-row ok"><i class="ti ti-check"></i> ' + esc(ep.name) + ' — ' + ep.shots.length + ' 個卡號</div>';
-      });
-      warnings.forEach(function(w){
-        html += '<div class="im-row warn"><i class="ti ti-alert-triangle"></i> ' + esc(w) + '</div>';
-      });
-      html += '<div style="font-size:11px;color:var(--text3);margin-top:8px">⚠ 匯入會新增集數，不會覆蓋或刪除現有資料</div>';
-      resultDiv.innerHTML = html;
-      document.getElementById('im-confirm').style.display = 'inline-flex';
-
-    } catch(err){
-      resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 讀取失敗：' + esc(err.message) + '</div>';
-    }
-  };
-  reader.readAsArrayBuffer(file);
-}
-
-function doImport(){
-  if(!importData || !importData.length) return;
-  var p = getP();
-  if(!p){
-    // no project selected: create one named after file
-    p = { id: uid(), name: '匯入備份 ' + today(), episodes: [] };
-    DB.projects.push(p);
-  }
-  // add episodes (avoid duplicate names)
-  importData.forEach(function(ep){
-    var exists = p.episodes.find(function(e){ return e.name === ep.name; });
-    if(exists){
-      // merge shots that don't already exist
-      ep.shots.forEach(function(s){
-        if(!exists.shots.find(function(x){ return x.shotId === s.shotId; })){
-          exists.shots.push(s);
-        }
-      });
-    } else {
-      p.episodes.push(ep);
-    }
-  });
-  persist();
-  closeImportModal();
-  renderSidebar();
-  selectP(p.id);
-  alert('匯入完成！共匯入 ' + importData.length + ' 個集數');
-}
-
-</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
 <style>
 :root{
   --bg:#0f1117;--bg2:#181c27;--bg3:#1e2235;--bg4:#252a3e;
@@ -596,7 +23,7 @@ body{background:var(--bg);color:var(--text);min-height:100vh;font-size:14px}
 @keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
 @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 
-/* ── LOGIN SCREEN ── */
+/* LOGIN */
 #login-screen{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
 .login-box{background:var(--bg2);border:1px solid var(--border2);border-radius:var(--rl);padding:40px 32px;width:100%;max-width:380px;animation:fadeIn .3s ease;text-align:center}
 .login-logo{display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:6px}
@@ -608,16 +35,17 @@ body{background:var(--bg);color:var(--text);min-height:100vh;font-size:14px}
 .btn-google:disabled{opacity:.5;cursor:not-allowed}
 #login-err{color:var(--red);font-size:12px;margin-top:12px;min-height:18px}
 
-/* ── MAIN APP ── */
-#app{display:flex;height:100vh;overflow:hidden;display:none}
+/* APP LAYOUT */
+#app{display:none;flex-direction:row;height:100vh;overflow:hidden}
 #sidebar{width:230px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0}
 #main{flex:1;overflow-y:auto;display:flex;flex-direction:column}
+
+/* SIDEBAR */
 .sh{padding:16px 14px 12px;border-bottom:1px solid var(--border)}
 .logo{font-size:12px;font-weight:700;color:var(--accent);letter-spacing:.05em;display:flex;align-items:center;gap:7px}
 .logo i{font-size:17px}
 .sub{font-size:11px;color:var(--text3);margin-top:3px}
 .user-bar{padding:8px 12px;background:var(--bg3);border-radius:var(--r);margin:8px;display:flex;align-items:center;gap:7px;font-size:12px}
-.user-bar i{color:var(--text3)}
 .user-email{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)}
 .btn-logout{background:none;border:none;color:var(--text3);cursor:pointer;font-size:13px;padding:2px}
 .btn-logout:hover{color:var(--red)}
@@ -627,8 +55,7 @@ body{background:var(--bg);color:var(--text);min-height:100vh;font-size:14px}
 .pi:hover{background:var(--bg3)}
 .pi.active{background:var(--bg4);border-color:var(--border2)}
 .pi-name{flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.pi-edit{opacity:0;font-size:14px;color:var(--text3);padding:2px;cursor:pointer}
-.pi-del{opacity:0;font-size:14px;color:var(--text3);padding:2px;cursor:pointer}
+.pi-edit,.pi-del{opacity:0;font-size:14px;color:var(--text3);padding:2px;cursor:pointer}
 .pi:hover .pi-edit,.pi:hover .pi-del{opacity:1}
 .pi-del:hover{color:var(--red)}
 .btn-ap{margin:0 8px 8px;padding:8px;border:1px dashed var(--border2);border-radius:var(--r);background:none;color:var(--text3);font-size:12px;cursor:pointer;width:calc(100% - 16px);display:flex;align-items:center;justify-content:center;gap:5px;transition:all .15s}
@@ -638,15 +65,8 @@ body{background:var(--bg);color:var(--text);min-height:100vh;font-size:14px}
 .btn-ex:hover{opacity:.85}
 .btn-im{width:100%;padding:9px;background:none;border:1px solid var(--border2);border-radius:var(--r);color:var(--text2);font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;margin-top:6px}
 .btn-im:hover{border-color:var(--green);color:var(--green);background:rgba(78,204,138,.06)}
-/* import modal */
-.im-drop{border:2px dashed var(--border2);border-radius:var(--rl);padding:20px;text-align:center;cursor:pointer;transition:all .2s;background:var(--bg)}
-.im-drop:hover,.im-drop.dv{border-color:var(--green);background:rgba(78,204,138,.05)}
-.im-drop i{font-size:28px;color:var(--text3);display:block;margin-bottom:7px}
-.im-result{margin-top:12px;max-height:200px;overflow-y:auto}
-.im-row{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:5px;font-size:12px;margin-bottom:3px}
-.im-row.ok{background:rgba(78,204,138,.08);color:var(--green)}
-.im-row.warn{background:rgba(245,200,66,.08);color:var(--gold)}
-.im-row.err{background:rgba(255,92,92,.08);color:var(--red)}
+
+/* TOPBAR */
 #topbar{padding:14px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;background:var(--bg2);flex-shrink:0;flex-wrap:wrap}
 #topbar h1{font-size:16px;font-weight:600;white-space:nowrap}
 .ep-tabs{display:flex;gap:5px;overflow-x:auto;flex:1}
@@ -658,11 +78,8 @@ body{background:var(--bg);color:var(--text);min-height:100vh;font-size:14px}
 .btn-aep{padding:5px 11px;border-radius:20px;font-size:12px;cursor:pointer;background:none;border:1px dashed var(--border2);color:var(--text3);white-space:nowrap;display:flex;align-items:center;gap:4px;transition:all .15s}
 .btn-aep:hover{border-color:var(--accent);color:var(--accent)}
 #content{flex:1;padding:18px 20px}
-.sir{display:flex;gap:8px;margin-bottom:16px;align-items:center}
-.sir input{background:var(--bg3);border:1px solid var(--border2);border-radius:var(--r);padding:8px 11px;color:var(--text);font-size:13px;width:160px}
-.sir input:focus{outline:none;border-color:var(--accent)}
-.btn-as{padding:8px 14px;background:var(--accent);border:none;border-radius:var(--r);color:#fff;font-size:13px;cursor:pointer;display:flex;align-items:center;gap:5px}
-.btn-as:hover{opacity:.85}
+
+/* TABLE */
 .st-wrap{overflow-x:auto}
 table.st{width:100%;border-collapse:separate;border-spacing:0 3px}
 table.st thead th{font-size:13px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.05em;padding:6px 9px;text-align:left;border-bottom:1px solid var(--border)}
@@ -675,12 +92,6 @@ table.st td:first-child{border-radius:var(--r) 0 0 var(--r)}
 table.st td:last-child{border-radius:0 var(--r) var(--r) 0}
 .sid{font-family:monospace;font-size:13px;font-weight:700;color:var(--accent);white-space:nowrap}
 .sid.g{color:var(--gold)}
-.round-block{padding:5px 7px;border-radius:6px;margin-bottom:5px;border:1px solid var(--border)}
-.round-block.r1{background:rgba(108,138,255,.05)}
-.round-block.r2{background:rgba(245,200,66,.06);border-color:rgba(245,200,66,.2)}
-.round-block.r3{background:rgba(78,204,138,.05);border-color:rgba(78,204,138,.2)}
-.round-label{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;margin-bottom:4px;color:var(--text3)}
-.round-label.r2{color:var(--gold)}
 textarea.ci{background:transparent;border:1px solid transparent;border-radius:5px;padding:3px 5px;color:var(--text);font-size:14px;resize:none;width:100%;min-height:28px;font-family:inherit;transition:border .15s}
 textarea.ci:focus{outline:none;border-color:var(--border2);background:var(--bg)}
 textarea.ci::placeholder{color:var(--text3)}
@@ -692,36 +103,35 @@ textarea.ci::placeholder{color:var(--text3)}
 .dt{font-size:12px;color:var(--text3);margin-top:2px}
 .ab{background:var(--gold);color:#1a1200;font-size:12px;font-weight:700;padding:2px 6px;border-radius:4px;display:inline-flex;align-items:center;gap:3px;margin-top:3px}
 .db2{background:rgba(78,204,138,.12);color:var(--green);font-size:12px;font-weight:600;padding:2px 6px;border-radius:4px;display:inline-flex;align-items:center;gap:3px;border:1px solid rgba(78,204,138,.3);margin-top:3px}
-.dsh{background:none;border:none;color:var(--text3);cursor:pointer;font-size:16px;padding:3px;border-radius:4px;transition:color .15s}
-.dsh:hover{color:var(--red)}
 .btn-add-round{background:none;border:1px dashed rgba(245,200,66,.4);border-radius:5px;color:var(--gold);font-size:13px;padding:3px 9px;cursor:pointer;display:flex;align-items:center;gap:4px;margin-top:4px;transition:all .15s}
 .btn-add-round:hover{background:rgba(245,200,66,.08)}
-.es{text-align:center;padding:50px 20px;color:var(--text3)}
-.es i{font-size:36px;display:block;margin-bottom:10px}
-.es h3{font-size:15px;color:var(--text2);margin-bottom:5px}
+.dsh{background:none;border:none;color:var(--text3);cursor:pointer;font-size:16px;padding:3px;border-radius:4px;transition:color .15s}
+.dsh:hover{color:var(--red)}
+
+/* STATS */
+.stats-bar{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+.sc{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:5px 10px;font-size:12px;display:flex;align-items:center;gap:5px}
+.sc .n{font-size:15px;font-weight:600}
+.sc .l{color:var(--text3)}
+
+/* MANUAL SHOT INPUT */
+.sir{display:flex;gap:8px;margin-bottom:16px;align-items:center}
+.sir input{background:var(--bg3);border:1px solid var(--border2);border-radius:var(--r);padding:8px 11px;color:var(--text);font-size:13px;width:160px}
+.sir input:focus{outline:none;border-color:var(--accent)}
+.btn-as{padding:8px 14px;background:var(--accent);border:none;border-radius:var(--r);color:#fff;font-size:13px;cursor:pointer;display:flex;align-items:center;gap:5px}
+.btn-as:hover{opacity:.85}
+
+/* MODAL */
 .mo{position:fixed;inset:0;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;z-index:200}
-.md{background:var(--bg3);border:1px solid var(--border2);border-radius:var(--rl);padding:22px;min-width:320px;max-width:440px;width:90%}
+.md{background:var(--bg3);border:1px solid var(--border2);border-radius:var(--rl);padding:22px;min-width:320px;max-width:480px;width:90%}
 .md h2{font-size:15px;margin-bottom:14px}
 .md input{width:100%;background:var(--bg);border:1px solid var(--border2);border-radius:var(--r);padding:9px 11px;color:var(--text);font-size:14px;margin-bottom:14px}
 .md input:focus{outline:none;border-color:var(--accent)}
 .mb{display:flex;gap:8px;justify-content:flex-end}
 .bcl{padding:7px 16px;background:none;border:1px solid var(--border2);border-radius:var(--r);color:var(--text2);cursor:pointer;font-size:13px}
 .bco{padding:7px 16px;background:var(--accent);border:none;border-radius:var(--r);color:#fff;cursor:pointer;font-size:13px;font-weight:500}
-.stats-bar{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap}
-.sc{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:5px 10px;font-size:12px;display:flex;align-items:center;gap:5px}
-.sc .n{font-size:15px;font-weight:600}
-.sc .l{color:var(--text3)}
-.prev-img{max-width:100%;max-height:140px;border-radius:var(--r);border:1px solid var(--border);display:block;margin:0 auto 6px}
-.chip-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;justify-content:center}
-.chip{background:var(--bg4);border:1px solid var(--accent);border-radius:5px;padding:3px 10px;font-size:12px;color:var(--accent);font-family:monospace;cursor:pointer;display:inline-flex;align-items:center;gap:4px}
-.chip:hover{background:rgba(108,138,255,.2)}
-.chip.added{border-color:var(--green);color:var(--green);background:rgba(78,204,138,.08);cursor:default}
-.saving{position:fixed;bottom:16px;right:16px;background:var(--bg3);border:1px solid var(--border2);border-radius:var(--r);padding:7px 14px;font-size:12px;color:var(--text2);display:flex;align-items:center;gap:6px;z-index:50;opacity:0;transition:opacity .3s}
-.saving.show{opacity:1}
-::-webkit-scrollbar{width:4px;height:4px}
-::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:2px}
 
-/* ── EXPORT MODAL ── */
+/* EXPORT MODAL */
 .ex-opts{display:flex;gap:10px;margin-top:4px}
 .ex-opt{flex:1;padding:14px 10px;border-radius:var(--r);border:2px solid var(--border2);background:var(--bg);cursor:pointer;text-align:center;transition:all .15s}
 .ex-opt:hover{border-color:var(--accent);background:rgba(108,138,255,.06)}
@@ -729,6 +139,28 @@ textarea.ci::placeholder{color:var(--text3)}
 .ex-opt:hover i{color:var(--accent)}
 .ex-opt strong{display:block;font-size:13px;margin-bottom:4px}
 .ex-opt small{font-size:13px;color:var(--text3);line-height:1.4}
+
+/* IMPORT MODAL */
+.im-drop{border:2px dashed var(--border2);border-radius:var(--rl);padding:20px;text-align:center;cursor:pointer;transition:all .2s;background:var(--bg)}
+.im-drop:hover,.im-drop.dv{border-color:var(--green);background:rgba(78,204,138,.05)}
+.im-drop i{font-size:28px;color:var(--text3);display:block;margin-bottom:7px}
+.im-result{margin-top:12px;max-height:200px;overflow-y:auto}
+.im-row{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:5px;font-size:12px;margin-bottom:3px}
+.im-row.ok{background:rgba(78,204,138,.08);color:var(--green)}
+.im-row.warn{background:rgba(245,200,66,.08);color:var(--gold)}
+.im-row.err{background:rgba(255,92,92,.08);color:var(--red)}
+
+/* SAVING */
+.saving{position:fixed;bottom:16px;right:16px;background:var(--bg3);border:1px solid var(--border2);border-radius:var(--r);padding:7px 14px;font-size:12px;color:var(--text2);display:flex;align-items:center;gap:6px;z-index:50;opacity:0;transition:opacity .3s}
+.saving.show{opacity:1}
+
+/* EMPTY */
+.es{text-align:center;padding:50px 20px;color:var(--text3)}
+.es i{font-size:36px;display:block;margin-bottom:10px}
+.es h3{font-size:15px;color:var(--text2);margin-bottom:5px}
+
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:2px}
 </style>
 </head>
 <body>
@@ -737,62 +169,16 @@ textarea.ci::placeholder{color:var(--text3)}
 <div id="login-screen">
   <div class="login-box">
     <div class="login-logo"><i class="ti ti-microphone-2"></i><h1>ADR 追蹤系統</h1></div>
-    <div class="login-sub">Cheer CN PU Dubbing — 影集補錄音清單統計<br>請用 Google 帳號登入</div>
+    <div class="login-sub">Cheer CN PU Dubbing<br>影集補錄音清單統計</div>
     <button class="btn-google" id="btn-google" onclick="doGoogleLogin()">
-      <svg viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/><path fill="none" d="M0 0h48v48H0z"/></svg>
+      <svg viewBox="0 0 48 48" style="width:20px;height:20px;flex-shrink:0"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/><path fill="none" d="M0 0h48v48H0z"/></svg>
       使用 Google 帳號登入
     </button>
     <div id="login-err"></div>
   </div>
 </div>
 
-
-<!-- IMPORT MODAL -->
-<div class="mo" id="import-modal" style="display:none">
-  <div class="md" onclick="event.stopPropagation()" style="max-width:520px">
-    <h2 style="margin-bottom:4px"><i class="ti ti-file-upload" style="color:var(--green)"></i> 匯入 Excel 備份</h2>
-    <p style="font-size:12px;color:var(--text3);margin-bottom:14px">選擇之前匯出的 Excel 檔案，系統將自動還原專案資料</p>
-    <div class="im-drop" id="im-drop" onclick="document.getElementById('im-file').click()"
-      ondragover="event.preventDefault();this.classList.add('dv')"
-      ondragleave="this.classList.remove('dv')"
-      ondrop="onImDrop(event)">
-      <i class="ti ti-table-import"></i>
-      <p style="font-size:13px;color:var(--text2)">拖曳 Excel 檔案至此 / 點擊選擇</p>
-      <small style="font-size:11px;color:var(--text3)">支援 .xlsx 格式（由本系統匯出的備份）</small>
-    </div>
-    <input type="file" id="im-file" accept=".xlsx" style="display:none" onchange="onImFile(this.files[0])">
-    <div class="im-result" id="im-result"></div>
-    <div class="mb" style="margin-top:14px">
-      <button class="bcl" onclick="closeImportModal()">取消</button>
-      <button class="bco" id="im-confirm" style="display:none;background:var(--green)" onclick="doImport()">確認匯入</button>
-    </div>
-  </div>
-</div>
-
-<!-- EXPORT MODAL -->
-<div class="mo" id="export-modal" style="display:none">
-  <div class="md" onclick="event.stopPropagation()" style="max-width:480px">
-    <h2 style="margin-bottom:6px"><i class="ti ti-file-spreadsheet" style="color:var(--accent)"></i> 選擇匯出範圍</h2>
-    <p style="font-size:12px;color:var(--text3);margin-bottom:14px">請選擇要匯出的內容</p>
-    <div class="ex-opts">
-      <div class="ex-opt" onclick="doExport(false)">
-        <i class="ti ti-table"></i>
-        <strong>全部整體匯出</strong>
-        <small>包含第1次及所有追加輪次的完整記錄</small>
-      </div>
-      <div class="ex-opt" onclick="doExport(true)">
-        <i class="ti ti-git-branch" style="color:var(--gold)"></i>
-        <strong style="color:var(--gold)">只匯出追加</strong>
-        <small>只包含有追加輪次的卡號，方便對照補錄</small>
-      </div>
-    </div>
-    <div class="mb" style="margin-top:16px">
-      <button class="bcl" onclick="closeExportModal()">取消</button>
-    </div>
-  </div>
-</div>
-
-<!-- MAIN APP -->
+<!-- APP -->
 <div id="app">
   <div id="sidebar">
     <div class="sh">
@@ -837,13 +223,56 @@ textarea.ci::placeholder{color:var(--text3)}
   </div>
 </div>
 
-<!-- SAVING INDICATOR -->
+<!-- EXPORT MODAL -->
+<div class="mo" id="export-modal" style="display:none">
+  <div class="md" onclick="event.stopPropagation()" style="max-width:480px">
+    <h2 style="margin-bottom:6px"><i class="ti ti-file-spreadsheet" style="color:var(--accent)"></i> 選擇匯出範圍</h2>
+    <p style="font-size:12px;color:var(--text3);margin-bottom:14px">請選擇要匯出的內容</p>
+    <div class="ex-opts">
+      <div class="ex-opt" onclick="doExport(false)">
+        <i class="ti ti-table"></i>
+        <strong>全部整體匯出</strong>
+        <small>包含第1次及所有追加輪次的完整記錄</small>
+      </div>
+      <div class="ex-opt" onclick="doExport(true)">
+        <i class="ti ti-git-branch" style="color:var(--gold)"></i>
+        <strong style="color:var(--gold)">只匯出追加</strong>
+        <small>只包含有追加輪次的卡號</small>
+      </div>
+    </div>
+    <div class="mb" style="margin-top:16px">
+      <button class="bcl" onclick="closeExportModal()">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- IMPORT MODAL -->
+<div class="mo" id="import-modal" style="display:none">
+  <div class="md" onclick="event.stopPropagation()" style="max-width:520px">
+    <h2 style="margin-bottom:4px"><i class="ti ti-file-upload" style="color:var(--green)"></i> 匯入 Excel 備份</h2>
+    <p style="font-size:12px;color:var(--text3);margin-bottom:14px">選擇之前匯出的 Excel 檔案，系統將自動還原專案資料</p>
+    <div class="im-drop" id="im-drop"
+      ondragover="event.preventDefault();this.classList.add('dv')"
+      ondragleave="this.classList.remove('dv')"
+      ondrop="onImDrop(event)">
+      <i class="ti ti-table-import"></i>
+      <p style="font-size:13px;color:var(--text2)">拖曳 Excel 檔案至此 / 點擊選擇</p>
+      <small style="font-size:11px;color:var(--text3)">支援 .xlsx 格式</small>
+    </div>
+    <input type="file" id="im-file" accept=".xlsx" style="display:none" onchange="onImFile(this.files[0])">
+    <div class="im-result" id="im-result"></div>
+    <div class="mb" style="margin-top:14px">
+      <button class="bcl" onclick="closeImportModal()">取消</button>
+      <button class="bco" id="im-confirm" style="display:none;background:var(--green)" onclick="doImport()">確認匯入</button>
+    </div>
+  </div>
+</div>
+
+<!-- SAVING -->
 <div class="saving" id="saving-ind"><i class="ti ti-loader-2" style="animation:spin 1s linear infinite"></i> 儲存中…</div>
 
 <script>
-/* ══════════════════════════════════════════
-   FIREBASE CONFIG  (你的設定)
-══════════════════════════════════════════ */
+/* ── FIREBASE ── */
 var firebaseConfig = {
   apiKey: "AIzaSyAw_8cW-mbW4WIpgl09Bw-9BkQyfL0Md38",
   authDomain: "cheersgartist-hue.github.io",
@@ -851,163 +280,135 @@ var firebaseConfig = {
   projectId: "cheer-cn-pu-dubbing",
   storageBucket: "cheer-cn-pu-dubbing.firebasestorage.app",
   messagingSenderId: "214901568108",
-  appId: "1:214901568108:web:5fa7d4d197acdc42659e49",
-  measurementId: "G-ZWDLHKJEB1"
+  appId: "1:214901568108:web:5fa7d4d197acdc42659e49"
 };
 firebase.initializeApp(firebaseConfig);
 var auth = firebase.auth();
 var db = firebase.database();
 
-/* ══════════════════════════════════════════
-   STATE
-══════════════════════════════════════════ */
+/* ── STATE ── */
 var DB = { projects: [] };
 var curPid = null, curEid = null, mCB = null;
-var saveTimer = null;
+var saveTimer = null, importData = null, exportTarget = 'ep';
 
-function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,5); }
-function today(){ return new Date().toLocaleDateString('zh-TW'); }
-function getP(){ return DB.projects.find(function(x){return x.id===curPid;})||null; }
-function getE(){ var p=getP(); return p?p.episodes.find(function(x){return x.id===curEid;})||null:null; }
-function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-function mkShot(shotId){ return {id:uid(),shotId:shotId,feedback:'',rounds:[mkRound()]}; }
-function mkRound(){ return {id:uid(),feedback:'',dialogText:'',onSite:false,dialogDate:'',walla:false,wallaDate:'',appendDone:false}; }
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2,5); }
+function today() { return new Date().toLocaleDateString('zh-TW'); }
+function getP() { return DB.projects.find(function(x){return x.id===curPid;})||null; }
+function getE() { var p=getP(); return p?p.episodes.find(function(x){return x.id===curEid;})||null:null; }
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function mkShot(id) { return {id:uid(),shotId:id,feedback:'',rounds:[mkRound()]}; }
+function mkRound() { return {id:uid(),feedback:'',dialogText:'',onSite:false,dialogDate:'',walla:false,wallaDate:'',appendDone:false}; }
 
-/* ══════════════════════════════════════════
-   FIREBASE SAVE / LOAD
-══════════════════════════════════════════ */
-function persist(){
-  var ind=document.getElementById('saving-ind');
+/* ── FIREBASE PERSIST ── */
+function persist() {
+  var ind = document.getElementById('saving-ind');
   ind.classList.add('show');
   clearTimeout(saveTimer);
-  saveTimer=setTimeout(function(){
-    var user=auth.currentUser;
+  saveTimer = setTimeout(function(){
+    var user = auth.currentUser;
     if(!user) return;
-    db.ref('shared').set(DB).then(function(){
-      ind.classList.remove('show');
-    }).catch(function(){ ind.classList.remove('show'); });
-  }, 600); // debounce 600ms
+    db.ref('shared').set(DB).then(function(){ ind.classList.remove('show'); }).catch(function(){ ind.classList.remove('show'); });
+  }, 600);
 }
 
-/* Firebase 讀回來時陣列會變成物件，需要轉換回陣列 */
-function fixArr(v){
+function fixArr(v) {
   if(!v) return [];
   if(Array.isArray(v)) return v;
   return Object.keys(v).sort(function(a,b){return Number(a)-Number(b);}).map(function(k){return v[k];});
 }
-function fixDB(val){
+function fixDB(val) {
   if(!val) return {projects:[]};
-  val.projects=fixArr(val.projects);
+  val.projects = fixArr(val.projects);
   val.projects.forEach(function(p){
     if(!p) return;
-    p.episodes=fixArr(p.episodes);
+    p.episodes = fixArr(p.episodes);
     p.episodes.forEach(function(ep){
       if(!ep) return;
-      ep.shots=fixArr(ep.shots);
+      ep.shots = fixArr(ep.shots);
       ep.shots.forEach(function(s){
         if(!s) return;
-        s.rounds=fixArr(s.rounds);
-        if(!s.rounds.length) s.rounds=[mkRound()];
-        // migrate old data: ensure each round has feedback
+        s.rounds = fixArr(s.rounds);
+        if(!s.rounds.length) s.rounds = [mkRound()];
         s.rounds.forEach(function(r){ if(r.feedback===undefined) r.feedback=''; });
-        // migrate old data: move shot-level feedback to first round if empty
-        if(s.feedback && !s.rounds[0].feedback) s.rounds[0].feedback=s.feedback;
+        if(s.feedback && !s.rounds[0].feedback) s.rounds[0].feedback = s.feedback;
       });
     });
   });
   return val;
 }
-function loadData(user){
-  db.ref('shared').on("value", function(snap){
-    DB=fixDB(snap.val());
+function loadData(user) {
+  db.ref('shared').on('value', function(snap){
+    DB = fixDB(snap.val());
     renderSidebar();
-    if(curPid){var p=getP();if(p){selectP(curPid);}else{curPid=null;curEid=null;showNoProj();}}
+    if(curPid){ var p=getP(); if(p){selectP(curPid);}else{curPid=null;curEid=null;showNoProj();} }
   });
 }
-
-function showNoProj(){
+function showNoProj() {
   document.getElementById('no-proj').style.display='flex';
   document.getElementById('proj-view').style.display='none';
 }
 
-/* ══════════════════════════════════════════
-   AUTH
-══════════════════════════════════════════ */
-/* ══════════════════════════════════════════
-   AUTH — Google 登入
-══════════════════════════════════════════ */
-var GOOGLE_SVG = '<svg viewBox="0 0 48 48" style="width:20px;height:20px;flex-shrink:0"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/><path fill="none" d="M0 0h48v48H0z"/></svg>';
+/* ── AUTH ── */
+var GSVG = '<svg viewBox="0 0 48 48" style="width:20px;height:20px;flex-shrink:0"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/><path fill="none" d="M0 0h48v48H0z"/></svg>';
 
-function resetLoginBtn(){
-  var btn=document.getElementById('btn-google');
-  if(btn){ btn.disabled=false; btn.innerHTML=GOOGLE_SVG+' 使用 Google 帳號登入'; }
+function resetLoginBtn() {
+  var btn = document.getElementById('btn-google');
+  if(btn){ btn.disabled=false; btn.innerHTML=GSVG+' 使用 Google 帳號登入'; }
 }
 
-function doGoogleLogin(){
-  var btn=document.getElementById('btn-google');
-  var err=document.getElementById('login-err');
-  btn.disabled=true;
-  btn.innerHTML='<i class="ti ti-loader-2" style="animation:spin 1s linear infinite;display:inline-block"></i> 登入中…';
-  err.textContent='';
+function doGoogleLogin() {
+  var btn = document.getElementById('btn-google');
+  var err = document.getElementById('login-err');
+  btn.disabled = true;
+  btn.innerHTML = '<i class="ti ti-loader-2" style="animation:spin 1s linear infinite;display:inline-block"></i> 登入中…';
+  err.textContent = '';
   var provider = new firebase.auth.GoogleAuthProvider();
-  provider.setCustomParameters({ prompt: 'select_account' });
-  // Try popup first; if blocked fall back to redirect
+  provider.setCustomParameters({prompt:'select_account'});
   auth.signInWithPopup(provider)
-    .then(function(){ /* onAuthStateChanged handles the rest */ })
+    .then(function(){})
     .catch(function(e){
       if(e.code === 'auth/popup-blocked' || e.code === 'auth/popup-closed-by-user'){
-        // Fallback: redirect
-        err.textContent='正在跳轉到 Google 登入頁面…';
+        err.textContent = '正在跳轉到 Google 登入頁面…';
         auth.signInWithRedirect(provider);
       } else {
         resetLoginBtn();
-        err.textContent = e.code==='auth/unauthorized-domain'
-          ? '此網域未授權，請聯絡管理員'
-          : e.message;
+        err.textContent = e.code === 'auth/unauthorized-domain' ? '此網域未授權，請聯絡管理員' : e.message;
       }
     });
 }
 
-// Handle redirect result on page load
-auth.getRedirectResult()
-  .then(function(result){ /* onAuthStateChanged handles */ })
-  .catch(function(e){
-    if(e.code && e.code !== 'auth/no-current-user'){
-      var errEl=document.getElementById('login-err');
-      if(errEl) errEl.textContent=e.message;
-      resetLoginBtn();
-    }
-  });
+auth.getRedirectResult().then(function(){}).catch(function(e){
+  if(e.code && e.code !== 'auth/no-current-user'){
+    var el = document.getElementById('login-err');
+    if(el) el.textContent = e.message;
+    resetLoginBtn();
+  }
+});
 
 auth.onAuthStateChanged(function(user){
-  var btn=document.getElementById('btn-google');
   if(user){
-    document.getElementById('login-screen').style.display='none';
-    document.getElementById('app').style.display='flex';
-    if(btn) btn.disabled=false;
-    document.getElementById('user-bar-wrap').innerHTML=
-      '<div class="user-bar">'+
-      (user.photoURL?'<img src="'+user.photoURL+'" style="width:20px;height:20px;border-radius:50%">':'<i class="ti ti-user-circle"></i>')+
-      '<span class="user-email">'+esc(user.displayName||user.email)+'</span>'+
-      '<button class="btn-logout" onclick="doLogout()" title="登出"><i class="ti ti-logout"></i></button>'+
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('app').style.display = 'flex';
+    resetLoginBtn();
+    document.getElementById('user-bar-wrap').innerHTML =
+      '<div class="user-bar">' +
+      (user.photoURL ? '<img src="'+user.photoURL+'" style="width:20px;height:20px;border-radius:50%">' : '<i class="ti ti-user-circle"></i>') +
+      '<span class="user-email">'+esc(user.displayName||user.email)+'</span>' +
+      '<button class="btn-logout" onclick="doLogout()" title="登出"><i class="ti ti-logout"></i></button>' +
       '</div>';
     loadData(user);
   } else {
-    document.getElementById('login-screen').style.display='flex';
-    document.getElementById('app').style.display='none';
-    if(btn) btn.disabled=false;
+    document.getElementById('login-screen').style.display = 'flex';
+    document.getElementById('app').style.display = 'none';
+    resetLoginBtn();
     DB={projects:[]};curPid=null;curEid=null;
   }
 });
 
-function doLogout(){
-  if(confirm('確定登出？')) auth.signOut();
-}
+function doLogout() { if(confirm('確定登出？')) auth.signOut(); }
 
-/* ══════════════════════════════════════════
-   MODAL
-══════════════════════════════════════════ */
-function mOpen(title,ph,def,cb){
+/* ── MODAL ── */
+function mOpen(title,ph,def,cb) {
   mCB=cb;
   document.getElementById('m-title').textContent=title;
   var i=document.getElementById('m-input');
@@ -1015,38 +416,38 @@ function mOpen(title,ph,def,cb){
   document.getElementById('modal').style.display='flex';
   setTimeout(function(){i.focus();i.select();},80);
 }
-function mClose(){ document.getElementById('modal').style.display='none'; mCB=null; }
-function mOK(){ var v=document.getElementById('m-input').value; var cb=mCB; mClose(); if(cb) cb(v); }
-document.getElementById('modal').addEventListener('click',function(e){ if(e.target===this) mClose(); });
-document.getElementById('export-modal').addEventListener('click',function(e){ if(e.target===this) closeExportModal(); });
+function mClose() { document.getElementById('modal').style.display='none'; mCB=null; }
+function mOK() { var v=document.getElementById('m-input').value; var cb=mCB; mClose(); if(cb) cb(v); }
+document.getElementById('modal').addEventListener('click',function(e){if(e.target===this) mClose();});
+document.getElementById('export-modal').addEventListener('click',function(e){if(e.target===this) closeExportModal();});
+document.getElementById('import-modal').addEventListener('click',function(e){if(e.target===this) closeImportModal();});
+document.getElementById('im-drop').addEventListener('click',function(){document.getElementById('im-file').click();});
 
-/* ══════════════════════════════════════════
-   PROJECTS
-══════════════════════════════════════════ */
-function renderSidebar(){
-  var list=document.getElementById('proj-list');
-  list.innerHTML='';
+/* ── PROJECTS ── */
+function renderSidebar() {
+  var list = document.getElementById('proj-list');
+  list.innerHTML = '';
   DB.projects.forEach(function(p){
-    var el=document.createElement('div');
-    el.className='pi'+(p.id===curPid?' active':'');
-    el.innerHTML='<i class="ti ti-folder" style="font-size:14px;color:var(--text3)"></i>'+
+    var el = document.createElement('div');
+    el.className = 'pi'+(p.id===curPid?' active':'');
+    el.innerHTML = '<i class="ti ti-folder" style="font-size:14px;color:var(--text3)"></i>'+
       '<span class="pi-name">'+esc(p.name)+'</span>'+
       '<i class="ti ti-pencil pi-edit"></i>'+
       '<i class="ti ti-trash pi-del"></i>';
     el.querySelector('.pi-edit').addEventListener('click',function(e){e.stopPropagation();editP(p.id);});
     el.querySelector('.pi-del').addEventListener('click',function(e){e.stopPropagation();delProject(p.id);});
-    el.addEventListener('click',function(){ selectP(p.id); });
+    el.addEventListener('click',function(){selectP(p.id);});
     list.appendChild(el);
   });
 }
-function addProject(){
+function addProject() {
   mOpen('新增專案','輸入專案名稱…','',function(name){
     if(!name||!name.trim()) return;
     var p={id:uid(),name:name.trim(),episodes:[]};
     DB.projects.push(p); persist(); renderSidebar(); selectP(p.id);
   });
 }
-function editP(id){
+function editP(id) {
   var p=DB.projects.find(function(x){return x.id===id;}); if(!p) return;
   mOpen('編輯專案名稱','新名稱…',p.name,function(name){
     if(!name||!name.trim()) return;
@@ -1054,15 +455,14 @@ function editP(id){
     if(curPid===id) document.getElementById('proj-title').textContent=p.name;
   });
 }
-function delProject(id){
+function delProject(id) {
   var p=DB.projects.find(function(x){return x.id===id;}); if(!p) return;
-  if(!confirm('確定刪除專案「'+p.name+'」？\n此操作無法復原，專案內所有集數和卡號都會刪除。')) return;
+  if(!confirm('確定刪除專案「'+p.name+'」？此操作無法復原。')) return;
   DB.projects=DB.projects.filter(function(x){return x.id!==id;});
-  if(curPid===id){ curPid=null; curEid=null; showNoProj(); }
+  if(curPid===id){curPid=null;curEid=null;showNoProj();}
   persist(); renderSidebar();
 }
-
-function selectP(id){
+function selectP(id) {
   curPid=id;
   var p=DB.projects.find(function(x){return x.id===id;}); if(!p) return;
   document.getElementById('no-proj').style.display='none';
@@ -1074,10 +474,8 @@ function selectP(id){
   renderSidebar(); renderTabs(); renderContent();
 }
 
-/* ══════════════════════════════════════════
-   EPISODES
-══════════════════════════════════════════ */
-function addEp(){
+/* ── EPISODES ── */
+function addEp() {
   var p=getP(); if(!p) return;
   var def='EP'+String(p.episodes.length+1).padStart(3,'0');
   mOpen('新增集數','例：EP001',def,function(name){
@@ -1086,14 +484,14 @@ function addEp(){
     p.episodes.push(ep); persist(); curEid=ep.id; renderTabs(); renderContent();
   });
 }
-function delEp(id){
+function delEp(id) {
   var p=getP(); if(!p) return;
   if(!confirm('確定刪除此集？')) return;
   p.episodes=p.episodes.filter(function(e){return e.id!==id;});
   if(curEid===id) curEid=p.episodes.length?p.episodes[0].id:null;
   persist(); renderTabs(); renderContent();
 }
-function renderTabs(){
+function renderTabs() {
   var p=getP(); var tabs=document.getElementById('ep-tabs');
   if(!p){tabs.innerHTML='';return;}
   tabs.innerHTML='';
@@ -1112,10 +510,8 @@ function renderTabs(){
   });
 }
 
-/* ══════════════════════════════════════════
-   CONTENT RENDER
-══════════════════════════════════════════ */
-function renderContent(){
+/* ── CONTENT ── */
+function renderContent() {
   var box=document.getElementById('content'); var ep=getE();
   if(!ep){
     box.innerHTML='<div class="es"><i class="ti ti-camera-off"></i><h3>尚無集數</h3><p>點擊「新增集數」開始</p></div>';
@@ -1130,7 +526,7 @@ function renderContent(){
 
   var h='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;gap:10px;flex-wrap:wrap">'+
     '<h2 style="font-size:15px;font-weight:600">'+esc(ep.name)+' — 卡號清單</h2>'+
-    '<button onclick="openExportModal(\'ep\')" style="padding:6px 12px;background:var(--bg3);border:1px solid var(--border2);border-radius:var(--r);color:var(--text2);font-size:12px;cursor:pointer;display:flex;align-items:center;gap:5px"><i class="ti ti-file-download"></i> 匯出本集</button>'+
+    '<button onclick="exportEpBtn()" style="padding:6px 12px;background:var(--bg3);border:1px solid var(--border2);border-radius:var(--r);color:var(--text2);font-size:12px;cursor:pointer;display:flex;align-items:center;gap:5px"><i class="ti ti-file-download"></i> 匯出本集</button>'+
     '</div>'+
     '<div class="stats-bar">'+
     '<div class="sc"><span class="n">'+total+'</span><span class="l">卡號總數</span></div>'+
@@ -1145,7 +541,7 @@ function renderContent(){
     '</div>';
 
   if(!shots.length){
-    h+='<div class="es"><i class="ti ti-list"></i><h3>尚無卡號</h3><p>上傳截圖或手動輸入</p></div>';
+    h+='<div class="es"><i class="ti ti-list"></i><h3>尚無卡號</h3><p>使用上方輸入欄新增</p></div>';
   } else {
     h+='<div class="st-wrap"><table class="st"><thead><tr>'+
       '<th style="width:100px">卡號</th>'+
@@ -1161,22 +557,19 @@ function renderContent(){
   box.innerHTML=h;
 }
 
-function rowH(s){
+function rowH(s) {
   var rounds=s.rounds||[mkRound()];
   var lastR=rounds[rounds.length-1];
   var hasAppend=rounds.length>1;
   var pendingAppend=hasAppend&&!lastR.appendDone;
   var html='';
-
   rounds.forEach(function(r,i){
     var isFirst=i===0;
-    var isLast=i===rounds.length-1;
     var lbl=i===0?'第 1 次':(i===1?'追加 1':'追加 '+i);
     var lblColor=i===0?'var(--text3)':'var(--gold)';
     var rowBg=pendingAppend&&!isFirst?'background:rgba(245,200,66,.06)':'';
     var borderLeft=pendingAppend&&!isFirst?'border-left:3px solid var(--gold)':'';
 
-    // id cell: only first row shows shotId; rowspan via display trick
     var idCell='<td style="vertical-align:middle;'+borderLeft+'">';
     if(isFirst){
       idCell+='<div class="sid'+(pendingAppend?' g':'')+'">'+esc(s.shotId)+'</div>';
@@ -1185,36 +578,30 @@ function rowH(s){
           ?'<div class="ab"><i class="ti ti-plus" style="font-size:12px"></i>追加×'+(rounds.length-1)+'</div>'
           :'<div class="db2"><i class="ti ti-check" style="font-size:12px"></i>已完成</div>';
       }
-      // add-round button only on first row
       idCell+='<button class="btn-add-round" style="margin-top:6px" onclick="addRound(\''+s.id+'\')"><i class="ti ti-plus" style="font-size:13px"></i> 追加</button>';
     }
     idCell+='</td>';
 
-    // round label cell
     var lblCell='<td style="text-align:center;vertical-align:top;padding-top:10px">'+
       '<span style="font-size:13px;font-weight:700;color:'+lblColor+'">'+lbl+'</span></td>';
 
-    // feedback cell
     var fbCell='<td style="vertical-align:top">'+
       '<textarea class="ci" rows="2" placeholder="整體反饋…" onchange="fldR(\''+s.id+'\',\''+r.id+'\',\'feedback\',this.value)">'+esc(r.feedback||'')+'</textarea>'+
       '</td>';
 
-    // dialog cell
     var dialCell='<td style="vertical-align:top">'+
       '<div class="cr'+(r.onSite?' d':'')+'" style="margin-bottom:3px"><input type="checkbox"'+(r.onSite?' checked':'')+' onchange="chkR(\''+s.id+'\',\''+r.id+'\',\'onSite\',this.checked)"> 現場討論</div>'+
-      (r.onSite?'<div class="osl" style="margin-bottom:4px">⚑ 現場討論</div>':'')+
+      (r.onSite?'<div class="osl" style="margin-bottom:4px">現場討論</div>':'')+
       '<textarea class="ci" rows="2" placeholder="台詞修改…" onchange="fldR(\''+s.id+'\',\''+r.id+'\',\'dialogText\',this.value)"'+(r.onSite?' style="opacity:.5"':'')+'>'+esc(r.dialogText||'')+'</textarea>'+
       (r.dialogDate?'<div class="dt"><i class="ti ti-clock" style="font-size:12px"></i> '+r.dialogDate+'</div>':'')+
       '</td>';
 
-    // walla cell
     var wallaCell='<td style="vertical-align:top">'+
       '<div class="cr"><input type="checkbox"'+(r.walla?' checked':'')+' onchange="chkR(\''+s.id+'\',\''+r.id+'\',\'walla\',this.checked)"> Walla（語氣詞）</div>'+
-      (r.walla?'<div style="font-size:13px;color:var(--teal);margin-top:2px">✦ Walla</div>':'')+
+      (r.walla?'<div style="font-size:13px;color:var(--teal);margin-top:2px">Walla</div>':'')+
       (r.wallaDate?'<div class="dt"><i class="ti ti-clock" style="font-size:12px"></i> '+r.wallaDate+'</div>':'')+
       '</td>';
 
-    // append done cell
     var appCell='<td style="vertical-align:top">';
     if(!isFirst){
       appCell+='<div class="cr ok"><input type="checkbox"'+(r.appendDone?' checked':'')+' onchange="chkR(\''+s.id+'\',\''+r.id+'\',\'appendDone\',this.checked)"> 已完成</div>';
@@ -1223,41 +610,45 @@ function rowH(s){
     }
     appCell+='</td>';
 
-    // first row: delete whole shot; append rows: delete that round
     var delCell=isFirst
       ?'<td style="vertical-align:top"><button class="dsh" title="刪除整個卡號" onclick="delShot(\''+s.id+'\')"><i class="ti ti-trash"></i></button></td>'
       :'<td style="vertical-align:top"><button class="dsh" title="刪除此追加" style="color:rgba(255,92,92,.5)" onclick="delRound(\''+s.id+'\',\''+r.id+'\')"><i class="ti ti-trash"></i></button></td>';
 
-    // row separator style
     var topBorder=!isFirst?'border-top:1px dashed rgba(255,255,255,0.06)':'';
     html+='<tr style="'+rowBg+';'+topBorder+'">'+idCell+lblCell+fbCell+dialCell+wallaCell+appCell+delCell+'</tr>';
   });
   return html;
 }
 
-/* ══════════════════════════════════════════
-   SHOTS & ROUNDS
-══════════════════════════════════════════ */
-function addShot(id){
+/* ── SHOTS & ROUNDS ── */
+function addShot(id) {
   var ep=getE(); if(!ep) return;
   var c=id.trim().toUpperCase(); if(!c) return;
   if(ep.shots.find(function(s){return s.shotId===c;})){ alert('卡號 '+c+' 已存在'); return; }
   ep.shots.push(mkShot(c)); persist(); renderContent();
 }
-function doAddShot(){ var i=document.getElementById('shot-inp'); if(!i) return; addShot(i.value); i.value=''; }
-function delShot(id){ var ep=getE(); if(!ep) return; ep.shots=ep.shots.filter(function(s){return s.id!==id;}); persist(); renderContent(); }
-function addRound(shotId){
+function doAddShot() { var i=document.getElementById('shot-inp'); if(!i) return; addShot(i.value); i.value=''; }
+function delShot(id) { var ep=getE(); if(!ep) return; ep.shots=ep.shots.filter(function(s){return s.id!==id;}); persist(); renderContent(); }
+function addRound(shotId) {
   var ep=getE(); if(!ep) return;
   var s=ep.shots.find(function(x){return x.id===shotId;}); if(!s) return;
   s.rounds.push(mkRound()); persist(); renderContent();
 }
-function fldR(shotId,roundId,field,val){
+function delRound(shotId,roundId) {
+  if(!confirm('確定刪除此追加輪次？')) return;
+  var ep=getE(); if(!ep) return;
+  var s=ep.shots.find(function(x){return x.id===shotId;}); if(!s) return;
+  s.rounds=s.rounds.filter(function(r){return r.id!==roundId;}); persist(); renderContent();
+}
+function fldR(shotId,roundId,field,val) {
   var ep=getE(); if(!ep) return;
   var s=ep.shots.find(function(x){return x.id===shotId;}); if(!s) return;
   var r=s.rounds.find(function(x){return x.id===roundId;}); if(!r) return;
-  r[field]=val; if(field==='dialogText') r.dialogDate=today(); persist();
+  r[field]=val;
+  if(field==='dialogText') r.dialogDate=today();
+  persist();
 }
-function chkR(shotId,roundId,field,val){
+function chkR(shotId,roundId,field,val) {
   var ep=getE(); if(!ep) return;
   var s=ep.shots.find(function(x){return x.id===shotId;}); if(!s) return;
   var r=s.rounds.find(function(x){return x.id===roundId;}); if(!r) return;
@@ -1267,228 +658,123 @@ function chkR(shotId,roundId,field,val){
   persist(); renderContent();
 }
 
-
-/* ══════════════════════════════════════════
-   EXPORT
-══════════════════════════════════════════ */
-var exportTarget = 'ep'; // 'ep' or 'all'
-
-function openExportModal(target){
-  exportTarget = target;
-  var mo = document.getElementById('export-modal');
-  mo.style.display = 'flex';
-}
-function closeExportModal(){
-  document.getElementById('export-modal').style.display = 'none';
-}
-function doExport(appendOnly){
+/* ── EXPORT ── */
+var COLS=[{wch:10},{wch:25},{wch:7},{wch:8},{wch:35},{wch:16},{wch:7},{wch:16},{wch:8}];
+function exportEpBtn() { exportTarget='ep'; openExportModal('ep'); }
+function openExportModal(t) { exportTarget=t; document.getElementById('export-modal').style.display='flex'; }
+function closeExportModal() { document.getElementById('export-modal').style.display='none'; }
+function doExport(appendOnly) {
   closeExportModal();
   if(exportTarget==='ep') runExportEp(appendOnly);
   else runExportAll(appendOnly);
 }
-
-function delRound(shotId, roundId){
-  if(!confirm('確定刪除此追加輪次？')) return;
-  var ep=getE(); if(!ep) return;
-  var s=ep.shots.find(function(x){return x.id===shotId;}); if(!s) return;
-  s.rounds=s.rounds.filter(function(r){return r.id!==roundId;});
-  persist(); renderContent();
-}
-
-var COLS = [{wch:10},{wch:25},{wch:7},{wch:8},{wch:35},{wch:16},{wch:7},{wch:16},{wch:8}];
-
-function epRows(ep, appendOnly){
+function epRows(ep,appendOnly) {
   var rows=[['卡號','整體反饋','輪次','現場討論','台詞修改','台詞更改日期','Walla','Walla日期','追加完成']];
-  var shots = ep.shots.slice().sort(function(a,b){return a.shotId.localeCompare(b.shotId,undefined,{numeric:true});});
-  shots.forEach(function(s){
-    var rounds = s.rounds||[];
-    // appendOnly: 只輸出追加輪次（round index >= 1）
-    var filtered = appendOnly ? rounds.filter(function(_,i){return i>0;}) : rounds;
-    if(!filtered.length) return; // appendOnly 且無追加，跳過此卡號
+  ep.shots.slice().sort(function(a,b){return a.shotId.localeCompare(b.shotId,undefined,{numeric:true});})
+  .forEach(function(s){
+    var rounds=s.rounds||[];
+    var filtered=appendOnly?rounds.filter(function(_,i){return i>0;}):rounds;
+    if(!filtered.length) return;
     filtered.forEach(function(r,fi){
-      var origIdx = appendOnly ? fi+1 : fi; // 顯示輪次標籤用原始 index
-      var isFirst = fi===0;
-      rows.push([
-        isFirst ? s.shotId : '',
-        isFirst ? (r.feedback||'') : (r.feedback||''),
-        appendOnly ? ('追加'+origIdx) : (origIdx===0?'第1次':'追加'+origIdx),
-        r.onSite?'是':'',
-        r.dialogText||'',
-        r.dialogDate||'',
-        r.walla?'是':'',
-        r.wallaDate||'',
-        origIdx===0?'':(r.appendDone?'是':'')
-      ]);
+      var origIdx=appendOnly?fi+1:fi;
+      var isFirst=fi===0;
+      rows.push([isFirst?s.shotId:'',isFirst?r.feedback||'':'',appendOnly?'追加'+origIdx:(origIdx===0?'第1次':'追加'+origIdx),r.onSite?'是':'',r.dialogText||'',r.dialogDate||'',r.walla?'是':'',r.wallaDate||'',origIdx===0?'':(r.appendDone?'是':'')]);
     });
   });
   return rows;
 }
-
-function runExportEp(appendOnly){
+function runExportEp(appendOnly) {
   var ep=getE(); if(!ep) return;
-  var suffix = appendOnly?'_追加':'_全部';
   var wb=XLSX.utils.book_new();
-  var ws=XLSX.utils.aoa_to_sheet(epRows(ep, appendOnly));
+  var ws=XLSX.utils.aoa_to_sheet(epRows(ep,appendOnly));
   ws['!cols']=COLS;
   XLSX.utils.book_append_sheet(wb,ws,ep.name.slice(0,31));
-  XLSX.writeFile(wb,(getP()?getP().name:'proj')+'_'+ep.name+suffix+'.xlsx');
+  XLSX.writeFile(wb,(getP()?getP().name:'proj')+'_'+ep.name+(appendOnly?'_追加':'_全部')+'.xlsx');
 }
-
-function runExportAll(appendOnly){
+function runExportAll(appendOnly) {
   var p=getP(); if(!p||!p.episodes.length){alert('請先選擇有資料的專案');return;}
-  var suffix = appendOnly?'_追加':'_全部';
   var wb=XLSX.utils.book_new();
   var sortedEps=p.episodes.slice().sort(function(a,b){return a.name.localeCompare(b.name,undefined,{numeric:true});});
   sortedEps.forEach(function(ep){
-    var ws=XLSX.utils.aoa_to_sheet(epRows(ep, appendOnly));
+    var ws=XLSX.utils.aoa_to_sheet(epRows(ep,appendOnly));
     ws['!cols']=COLS;
     XLSX.utils.book_append_sheet(wb,ws,ep.name.slice(0,31));
   });
-  XLSX.writeFile(wb,p.name+suffix+'.xlsx');
+  XLSX.writeFile(wb,p.name+(appendOnly?'_追加':'_全部')+'.xlsx');
 }
 
-/* ══════════════════════════════════════════
-   IMPORT
-══════════════════════════════════════════ */
-var importData = null; // parsed preview data before confirming
-
-function openImportModal(){
-  importData = null;
-  document.getElementById('im-result').innerHTML = '';
-  document.getElementById('im-confirm').style.display = 'none';
-  document.getElementById('im-file').value = '';
-  document.getElementById('import-modal').style.display = 'flex';
+/* ── IMPORT ── */
+function openImportModal() {
+  importData=null;
+  document.getElementById('im-result').innerHTML='';
+  document.getElementById('im-confirm').style.display='none';
+  document.getElementById('im-file').value='';
+  document.getElementById('import-modal').style.display='flex';
 }
-function closeImportModal(){
-  document.getElementById('import-modal').style.display = 'none';
-  importData = null;
+function closeImportModal() { document.getElementById('import-modal').style.display='none'; importData=null; }
+function onImDrop(e) {
+  e.preventDefault(); document.getElementById('im-drop').classList.remove('dv');
+  var f=e.dataTransfer.files[0]; if(f) parseImport(f);
 }
-document.getElementById('import-modal').addEventListener('click', function(e){ if(e.target===this) closeImportModal(); });
-
-function onImDrop(e){
-  e.preventDefault();
-  document.getElementById('im-drop').classList.remove('dv');
-  var f = e.dataTransfer.files[0];
-  if(f) parseImport(f);
-}
-function onImFile(f){ if(f) parseImport(f); }
-
-function parseImport(file){
-  var resultDiv = document.getElementById('im-result');
-  resultDiv.innerHTML = '<p style="font-size:12px;color:var(--text3)">讀取中…</p>';
-  document.getElementById('im-confirm').style.display = 'none';
-
-  var reader = new FileReader();
-  reader.onload = function(e){
-    try {
-      var wb = XLSX.read(e.target.result, {type:'array'});
-      // Each sheet = one episode
-      // Columns: 卡號, 整體反饋, 輪次, 現場討論, 台詞修改, 台詞更改日期, Walla, Walla日期, 追加完成
-      var episodes = [];
-      var warnings = [];
-
+function onImFile(f) { if(f) parseImport(f); }
+function parseImport(file) {
+  var rd=document.getElementById('im-result');
+  rd.innerHTML='<p style="font-size:12px;color:var(--text3)">讀取中…</p>';
+  document.getElementById('im-confirm').style.display='none';
+  var reader=new FileReader();
+  reader.onload=function(e){
+    try{
+      var wb=XLSX.read(e.target.result,{type:'array'});
+      var episodes=[],warnings=[];
       wb.SheetNames.forEach(function(sheetName){
-        var ws = wb.Sheets[sheetName];
-        var rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
-        if(rows.length < 2){ warnings.push(sheetName + '：無資料，略過'); return; }
-
-        var ep = { id: uid(), name: sheetName, shots: [] };
-        var currentShot = null;
-
-        // skip header row
-        for(var i=1; i<rows.length; i++){
-          var row = rows[i];
-          var shotId = String(row[0]||'').trim().toUpperCase();
-          var feedback = String(row[1]||'').trim();
-          var roundLbl = String(row[2]||'').trim();
-          var onSite = String(row[3]||'').trim() === '是';
-          var dialogText = String(row[4]||'').trim();
-          var dialogDate = String(row[5]||'').trim();
-          var walla = String(row[6]||'').trim() === '是';
-          var wallaDate = String(row[7]||'').trim();
-          var appendDone = String(row[8]||'').trim() === '是';
-
-          if(shotId){
-            // new shot
-            currentShot = { id: uid(), shotId: shotId, feedback: feedback, rounds: [] };
-            ep.shots.push(currentShot);
-          }
-          if(currentShot && roundLbl){
-            currentShot.rounds.push({
-              id: uid(),
-              feedback: feedback,
-              dialogText: dialogText,
-              onSite: onSite,
-              dialogDate: dialogDate,
-              walla: walla,
-              wallaDate: wallaDate,
-              appendDone: appendDone
-            });
-          }
-          // ensure at least one round
-          if(currentShot && currentShot.rounds.length === 0){
-            currentShot.rounds.push(mkRound());
-          }
+        var ws=wb.Sheets[sheetName];
+        var rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:''});
+        if(rows.length<2){warnings.push(sheetName+': 無資料，略過');return;}
+        var ep={id:uid(),name:sheetName,shots:[]};
+        var currentShot=null;
+        for(var i=1;i<rows.length;i++){
+          var row=rows[i];
+          var shotId=String(row[0]||'').trim().toUpperCase();
+          var feedback=String(row[1]||'').trim();
+          var roundLbl=String(row[2]||'').trim();
+          var onSite=String(row[3]||'').trim()==='是';
+          var dialogText=String(row[4]||'').trim();
+          var dialogDate=String(row[5]||'').trim();
+          var walla=String(row[6]||'').trim()==='是';
+          var wallaDate=String(row[7]||'').trim();
+          var appendDone=String(row[8]||'').trim()==='是';
+          if(shotId){currentShot={id:uid(),shotId:shotId,feedback:feedback,rounds:[]};ep.shots.push(currentShot);}
+          if(currentShot&&roundLbl){currentShot.rounds.push({id:uid(),feedback:feedback,dialogText:dialogText,onSite:onSite,dialogDate:dialogDate,walla:walla,wallaDate:wallaDate,appendDone:appendDone});}
+          if(currentShot&&currentShot.rounds.length===0){currentShot.rounds.push(mkRound());}
         }
-        // clean up shots with no rounds
-        ep.shots = ep.shots.filter(function(s){ return s.rounds.length > 0; });
-        if(ep.shots.length > 0) episodes.push(ep);
-        else warnings.push(sheetName + '：無有效卡號，略過');
+        ep.shots=ep.shots.filter(function(s){return s.rounds.length>0;});
+        if(ep.shots.length>0) episodes.push(ep);
+        else warnings.push(sheetName+': 無有效卡號，略過');
       });
-
-      if(!episodes.length){
-        resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 找不到有效資料，請確認是本系統匯出的 Excel</div>';
-        return;
-      }
-
-      importData = episodes;
-      var html = '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">預覽（確認後將新增至現有專案）：</div>';
-      episodes.forEach(function(ep){
-        html += '<div class="im-row ok"><i class="ti ti-check"></i> ' + esc(ep.name) + ' — ' + ep.shots.length + ' 個卡號</div>';
-      });
-      warnings.forEach(function(w){
-        html += '<div class="im-row warn"><i class="ti ti-alert-triangle"></i> ' + esc(w) + '</div>';
-      });
-      html += '<div style="font-size:11px;color:var(--text3);margin-top:8px">⚠ 匯入會新增集數，不會覆蓋或刪除現有資料</div>';
-      resultDiv.innerHTML = html;
-      document.getElementById('im-confirm').style.display = 'inline-flex';
-
-    } catch(err){
-      resultDiv.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 讀取失敗：' + esc(err.message) + '</div>';
-    }
+      if(!episodes.length){rd.innerHTML='<div class="im-row err"><i class="ti ti-alert-circle"></i> 找不到有效資料</div>';return;}
+      importData=episodes;
+      var html='<div style="font-size:12px;color:var(--text2);margin-bottom:6px">預覽：</div>';
+      episodes.forEach(function(ep){html+='<div class="im-row ok"><i class="ti ti-check"></i> '+esc(ep.name)+' — '+ep.shots.length+' 個卡號</div>';});
+      warnings.forEach(function(w){html+='<div class="im-row warn"><i class="ti ti-alert-triangle"></i> '+esc(w)+'</div>';});
+      html+='<div style="font-size:11px;color:var(--text3);margin-top:8px">匯入會新增集數，不會覆蓋現有資料</div>';
+      rd.innerHTML=html;
+      document.getElementById('im-confirm').style.display='inline-flex';
+    }catch(err){rd.innerHTML='<div class="im-row err"><i class="ti ti-alert-circle"></i> 讀取失敗：'+esc(err.message)+'</div>';}
   };
   reader.readAsArrayBuffer(file);
 }
-
-function doImport(){
-  if(!importData || !importData.length) return;
-  var p = getP();
-  if(!p){
-    // no project selected: create one named after file
-    p = { id: uid(), name: '匯入備份 ' + today(), episodes: [] };
-    DB.projects.push(p);
-  }
-  // add episodes (avoid duplicate names)
+function doImport() {
+  if(!importData||!importData.length) return;
+  var p=getP();
+  if(!p){p={id:uid(),name:'匯入備份 '+today(),episodes:[]};DB.projects.push(p);}
   importData.forEach(function(ep){
-    var exists = p.episodes.find(function(e){ return e.name === ep.name; });
-    if(exists){
-      // merge shots that don't already exist
-      ep.shots.forEach(function(s){
-        if(!exists.shots.find(function(x){ return x.shotId === s.shotId; })){
-          exists.shots.push(s);
-        }
-      });
-    } else {
-      p.episodes.push(ep);
-    }
+    var exists=p.episodes.find(function(e){return e.name===ep.name;});
+    if(exists){ep.shots.forEach(function(s){if(!exists.shots.find(function(x){return x.shotId===s.shotId;})){exists.shots.push(s);}});}
+    else{p.episodes.push(ep);}
   });
-  persist();
-  closeImportModal();
-  renderSidebar();
-  selectP(p.id);
-  alert('匯入完成！共匯入 ' + importData.length + ' 個集數');
+  persist(); closeImportModal(); renderSidebar(); selectP(p.id);
+  alert('匯入完成！共匯入 '+importData.length+' 個集數');
 }
-
 </script>
 </body>
 </html>
