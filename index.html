@@ -5,10 +5,490 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ADR 補錄音清單系統</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@2.44.0/tabler-icons.min.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js">
+/* ── SHOTLIST IMPORT ── */
+var shotlistData = null;
+
+function openShotlistModal() {
+  if(!getE()){ alert('請先選擇要匯入的集數（點擊上方頁籤選好集數再來操作）'); return; }
+  shotlistData = null;
+  document.getElementById('sl-result').innerHTML = '';
+  document.getElementById('sl-confirm').style.display = 'none';
+  document.getElementById('sl-file').value = '';
+  document.getElementById('shotlist-modal').style.display = 'flex';
+}
+function closeShotlistModal() { document.getElementById('shotlist-modal').style.display='none'; shotlistData=null; }
+document.getElementById('shotlist-modal').addEventListener('click',function(e){if(e.target===this) closeShotlistModal();});
+document.getElementById('sl-drop').addEventListener('click',function(){document.getElementById('sl-file').click();});
+
+function onSlDrop(e) {
+  e.preventDefault(); document.getElementById('sl-drop').classList.remove('dv');
+  var f=e.dataTransfer.files[0]; if(f) parseSlFile(f);
+}
+function onSlFile(f) { if(f) parseSlFile(f); }
+
+function parseSlFile(file) {
+  var rd = document.getElementById('sl-result');
+  rd.innerHTML = '<p style="font-size:12px;color:var(--text3)">讀取中…</p>';
+  document.getElementById('sl-confirm').style.display = 'none';
+
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      var wb = XLSX.read(e.target.result, {type:'array'});
+      var allShots = [];
+      var warnings = [];
+
+      // Try each sheet to find Shotcode column
+      wb.SheetNames.forEach(function(sheetName) {
+        var ws = wb.Sheets[sheetName];
+        var rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
+        if(rows.length < 2) return;
+
+        // Find header row and Shotcode column
+        var headerRow = -1, shotcodeCol = -1;
+        for(var i=0; i<Math.min(5,rows.length); i++) {
+          for(var j=0; j<rows[i].length; j++) {
+            var cell = String(rows[i][j]||'').trim().toLowerCase();
+            if(cell === 'shotcode' || cell === 'shotcode ') {
+              headerRow = i; shotcodeCol = j; break;
+            }
+          }
+          if(headerRow >= 0) break;
+        }
+
+        if(shotcodeCol < 0) {
+          // Try to find column containing EP###_SEQ###_SH### pattern
+          for(var i=1; i<Math.min(10,rows.length); i++) {
+            for(var j=0; j<rows[i].length; j++) {
+              if(/EP\d+_SEQ\d+_SH\d+/i.test(String(rows[i][j]||''))) {
+                shotcodeCol = j; headerRow = i-1; break;
+              }
+            }
+            if(shotcodeCol >= 0) break;
+          }
+        }
+
+        if(shotcodeCol < 0) { warnings.push(sheetName+': 找不到 Shotcode 欄位，略過'); return; }
+
+        // Collect shot IDs
+        var sheetShots = [];
+        for(var i=headerRow+1; i<rows.length; i++) {
+          var val = String(rows[i][shotcodeCol]||'').trim();
+          if(!val) continue;
+          // Extract SH### part - support full EP_SEQ_SH format
+          var match = val.match(/SH\d+/i);
+          if(match) sheetShots.push(val.toUpperCase());
+        }
+        if(sheetShots.length) allShots = allShots.concat(sheetShots);
+        else warnings.push(sheetName+': 找不到有效卡號');
+      });
+
+      // Deduplicate
+      var seen = {};
+      var unique = allShots.filter(function(s){ if(seen[s]) return false; seen[s]=true; return true; });
+
+      if(!unique.length) {
+        rd.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 找不到 Shotcode 資料</div>';
+        return;
+      }
+
+      // Check which already exist in current episode
+      var ep = getE();
+      var existing = 0, newOnes = [];
+      unique.forEach(function(shotId) {
+        if(ep && ep.shots.find(function(s){return s.shotId===shotId;})) existing++;
+        else newOnes.push(shotId);
+      });
+
+      shotlistData = newOnes;
+      var html = '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">偵測結果：</div>';
+      html += '<div class="im-row ok"><i class="ti ti-check"></i> 共找到 '+unique.length+' 個卡號，將新增 '+newOnes.length+' 個</div>';
+      if(existing) html += '<div class="im-row warn"><i class="ti ti-info-circle"></i> '+existing+' 個已存在，略過</div>';
+      warnings.forEach(function(w){ html += '<div class="im-row warn"><i class="ti ti-alert-triangle"></i> '+esc(w)+'</div>'; });
+      html += '<div style="font-size:11px;color:var(--text3);margin-top:8px">匯入目標：'+esc(ep?ep.name:'未選擇集數')+'</div>';
+      rd.innerHTML = html;
+      if(newOnes.length > 0) document.getElementById('sl-confirm').style.display = 'inline-flex';
+
+    } catch(err) {
+      rd.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 讀取失敗：'+esc(err.message)+'</div>';
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function doImportShotlist() {
+  if(!shotlistData||!shotlistData.length) return;
+  var ep = getE(); if(!ep) return;
+  shotlistData.forEach(function(shotId){ ep.shots.push(mkShot(shotId)); });
+  persist(); closeShotlistModal(); renderContent();
+  alert('成功匯入 '+shotlistData.length+' 個卡號到 '+ep.name);
+}
+
+</script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js">
+/* ── SHOTLIST IMPORT ── */
+var shotlistData = null;
+
+function openShotlistModal() {
+  if(!getE()){ alert('請先選擇要匯入的集數（點擊上方頁籤選好集數再來操作）'); return; }
+  shotlistData = null;
+  document.getElementById('sl-result').innerHTML = '';
+  document.getElementById('sl-confirm').style.display = 'none';
+  document.getElementById('sl-file').value = '';
+  document.getElementById('shotlist-modal').style.display = 'flex';
+}
+function closeShotlistModal() { document.getElementById('shotlist-modal').style.display='none'; shotlistData=null; }
+document.getElementById('shotlist-modal').addEventListener('click',function(e){if(e.target===this) closeShotlistModal();});
+document.getElementById('sl-drop').addEventListener('click',function(){document.getElementById('sl-file').click();});
+
+function onSlDrop(e) {
+  e.preventDefault(); document.getElementById('sl-drop').classList.remove('dv');
+  var f=e.dataTransfer.files[0]; if(f) parseSlFile(f);
+}
+function onSlFile(f) { if(f) parseSlFile(f); }
+
+function parseSlFile(file) {
+  var rd = document.getElementById('sl-result');
+  rd.innerHTML = '<p style="font-size:12px;color:var(--text3)">讀取中…</p>';
+  document.getElementById('sl-confirm').style.display = 'none';
+
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      var wb = XLSX.read(e.target.result, {type:'array'});
+      var allShots = [];
+      var warnings = [];
+
+      // Try each sheet to find Shotcode column
+      wb.SheetNames.forEach(function(sheetName) {
+        var ws = wb.Sheets[sheetName];
+        var rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
+        if(rows.length < 2) return;
+
+        // Find header row and Shotcode column
+        var headerRow = -1, shotcodeCol = -1;
+        for(var i=0; i<Math.min(5,rows.length); i++) {
+          for(var j=0; j<rows[i].length; j++) {
+            var cell = String(rows[i][j]||'').trim().toLowerCase();
+            if(cell === 'shotcode' || cell === 'shotcode ') {
+              headerRow = i; shotcodeCol = j; break;
+            }
+          }
+          if(headerRow >= 0) break;
+        }
+
+        if(shotcodeCol < 0) {
+          // Try to find column containing EP###_SEQ###_SH### pattern
+          for(var i=1; i<Math.min(10,rows.length); i++) {
+            for(var j=0; j<rows[i].length; j++) {
+              if(/EP\d+_SEQ\d+_SH\d+/i.test(String(rows[i][j]||''))) {
+                shotcodeCol = j; headerRow = i-1; break;
+              }
+            }
+            if(shotcodeCol >= 0) break;
+          }
+        }
+
+        if(shotcodeCol < 0) { warnings.push(sheetName+': 找不到 Shotcode 欄位，略過'); return; }
+
+        // Collect shot IDs
+        var sheetShots = [];
+        for(var i=headerRow+1; i<rows.length; i++) {
+          var val = String(rows[i][shotcodeCol]||'').trim();
+          if(!val) continue;
+          // Extract SH### part - support full EP_SEQ_SH format
+          var match = val.match(/SH\d+/i);
+          if(match) sheetShots.push(val.toUpperCase());
+        }
+        if(sheetShots.length) allShots = allShots.concat(sheetShots);
+        else warnings.push(sheetName+': 找不到有效卡號');
+      });
+
+      // Deduplicate
+      var seen = {};
+      var unique = allShots.filter(function(s){ if(seen[s]) return false; seen[s]=true; return true; });
+
+      if(!unique.length) {
+        rd.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 找不到 Shotcode 資料</div>';
+        return;
+      }
+
+      // Check which already exist in current episode
+      var ep = getE();
+      var existing = 0, newOnes = [];
+      unique.forEach(function(shotId) {
+        if(ep && ep.shots.find(function(s){return s.shotId===shotId;})) existing++;
+        else newOnes.push(shotId);
+      });
+
+      shotlistData = newOnes;
+      var html = '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">偵測結果：</div>';
+      html += '<div class="im-row ok"><i class="ti ti-check"></i> 共找到 '+unique.length+' 個卡號，將新增 '+newOnes.length+' 個</div>';
+      if(existing) html += '<div class="im-row warn"><i class="ti ti-info-circle"></i> '+existing+' 個已存在，略過</div>';
+      warnings.forEach(function(w){ html += '<div class="im-row warn"><i class="ti ti-alert-triangle"></i> '+esc(w)+'</div>'; });
+      html += '<div style="font-size:11px;color:var(--text3);margin-top:8px">匯入目標：'+esc(ep?ep.name:'未選擇集數')+'</div>';
+      rd.innerHTML = html;
+      if(newOnes.length > 0) document.getElementById('sl-confirm').style.display = 'inline-flex';
+
+    } catch(err) {
+      rd.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 讀取失敗：'+esc(err.message)+'</div>';
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function doImportShotlist() {
+  if(!shotlistData||!shotlistData.length) return;
+  var ep = getE(); if(!ep) return;
+  shotlistData.forEach(function(shotId){ ep.shots.push(mkShot(shotId)); });
+  persist(); closeShotlistModal(); renderContent();
+  alert('成功匯入 '+shotlistData.length+' 個卡號到 '+ep.name);
+}
+
+</script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js">
+/* ── SHOTLIST IMPORT ── */
+var shotlistData = null;
+
+function openShotlistModal() {
+  if(!getE()){ alert('請先選擇要匯入的集數（點擊上方頁籤選好集數再來操作）'); return; }
+  shotlistData = null;
+  document.getElementById('sl-result').innerHTML = '';
+  document.getElementById('sl-confirm').style.display = 'none';
+  document.getElementById('sl-file').value = '';
+  document.getElementById('shotlist-modal').style.display = 'flex';
+}
+function closeShotlistModal() { document.getElementById('shotlist-modal').style.display='none'; shotlistData=null; }
+document.getElementById('shotlist-modal').addEventListener('click',function(e){if(e.target===this) closeShotlistModal();});
+document.getElementById('sl-drop').addEventListener('click',function(){document.getElementById('sl-file').click();});
+
+function onSlDrop(e) {
+  e.preventDefault(); document.getElementById('sl-drop').classList.remove('dv');
+  var f=e.dataTransfer.files[0]; if(f) parseSlFile(f);
+}
+function onSlFile(f) { if(f) parseSlFile(f); }
+
+function parseSlFile(file) {
+  var rd = document.getElementById('sl-result');
+  rd.innerHTML = '<p style="font-size:12px;color:var(--text3)">讀取中…</p>';
+  document.getElementById('sl-confirm').style.display = 'none';
+
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      var wb = XLSX.read(e.target.result, {type:'array'});
+      var allShots = [];
+      var warnings = [];
+
+      // Try each sheet to find Shotcode column
+      wb.SheetNames.forEach(function(sheetName) {
+        var ws = wb.Sheets[sheetName];
+        var rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
+        if(rows.length < 2) return;
+
+        // Find header row and Shotcode column
+        var headerRow = -1, shotcodeCol = -1;
+        for(var i=0; i<Math.min(5,rows.length); i++) {
+          for(var j=0; j<rows[i].length; j++) {
+            var cell = String(rows[i][j]||'').trim().toLowerCase();
+            if(cell === 'shotcode' || cell === 'shotcode ') {
+              headerRow = i; shotcodeCol = j; break;
+            }
+          }
+          if(headerRow >= 0) break;
+        }
+
+        if(shotcodeCol < 0) {
+          // Try to find column containing EP###_SEQ###_SH### pattern
+          for(var i=1; i<Math.min(10,rows.length); i++) {
+            for(var j=0; j<rows[i].length; j++) {
+              if(/EP\d+_SEQ\d+_SH\d+/i.test(String(rows[i][j]||''))) {
+                shotcodeCol = j; headerRow = i-1; break;
+              }
+            }
+            if(shotcodeCol >= 0) break;
+          }
+        }
+
+        if(shotcodeCol < 0) { warnings.push(sheetName+': 找不到 Shotcode 欄位，略過'); return; }
+
+        // Collect shot IDs
+        var sheetShots = [];
+        for(var i=headerRow+1; i<rows.length; i++) {
+          var val = String(rows[i][shotcodeCol]||'').trim();
+          if(!val) continue;
+          // Extract SH### part - support full EP_SEQ_SH format
+          var match = val.match(/SH\d+/i);
+          if(match) sheetShots.push(val.toUpperCase());
+        }
+        if(sheetShots.length) allShots = allShots.concat(sheetShots);
+        else warnings.push(sheetName+': 找不到有效卡號');
+      });
+
+      // Deduplicate
+      var seen = {};
+      var unique = allShots.filter(function(s){ if(seen[s]) return false; seen[s]=true; return true; });
+
+      if(!unique.length) {
+        rd.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 找不到 Shotcode 資料</div>';
+        return;
+      }
+
+      // Check which already exist in current episode
+      var ep = getE();
+      var existing = 0, newOnes = [];
+      unique.forEach(function(shotId) {
+        if(ep && ep.shots.find(function(s){return s.shotId===shotId;})) existing++;
+        else newOnes.push(shotId);
+      });
+
+      shotlistData = newOnes;
+      var html = '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">偵測結果：</div>';
+      html += '<div class="im-row ok"><i class="ti ti-check"></i> 共找到 '+unique.length+' 個卡號，將新增 '+newOnes.length+' 個</div>';
+      if(existing) html += '<div class="im-row warn"><i class="ti ti-info-circle"></i> '+existing+' 個已存在，略過</div>';
+      warnings.forEach(function(w){ html += '<div class="im-row warn"><i class="ti ti-alert-triangle"></i> '+esc(w)+'</div>'; });
+      html += '<div style="font-size:11px;color:var(--text3);margin-top:8px">匯入目標：'+esc(ep?ep.name:'未選擇集數')+'</div>';
+      rd.innerHTML = html;
+      if(newOnes.length > 0) document.getElementById('sl-confirm').style.display = 'inline-flex';
+
+    } catch(err) {
+      rd.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 讀取失敗：'+esc(err.message)+'</div>';
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function doImportShotlist() {
+  if(!shotlistData||!shotlistData.length) return;
+  var ep = getE(); if(!ep) return;
+  shotlistData.forEach(function(shotId){ ep.shots.push(mkShot(shotId)); });
+  persist(); closeShotlistModal(); renderContent();
+  alert('成功匯入 '+shotlistData.length+' 個卡號到 '+ep.name);
+}
+
+</script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js">
+/* ── SHOTLIST IMPORT ── */
+var shotlistData = null;
+
+function openShotlistModal() {
+  if(!getE()){ alert('請先選擇要匯入的集數（點擊上方頁籤選好集數再來操作）'); return; }
+  shotlistData = null;
+  document.getElementById('sl-result').innerHTML = '';
+  document.getElementById('sl-confirm').style.display = 'none';
+  document.getElementById('sl-file').value = '';
+  document.getElementById('shotlist-modal').style.display = 'flex';
+}
+function closeShotlistModal() { document.getElementById('shotlist-modal').style.display='none'; shotlistData=null; }
+document.getElementById('shotlist-modal').addEventListener('click',function(e){if(e.target===this) closeShotlistModal();});
+document.getElementById('sl-drop').addEventListener('click',function(){document.getElementById('sl-file').click();});
+
+function onSlDrop(e) {
+  e.preventDefault(); document.getElementById('sl-drop').classList.remove('dv');
+  var f=e.dataTransfer.files[0]; if(f) parseSlFile(f);
+}
+function onSlFile(f) { if(f) parseSlFile(f); }
+
+function parseSlFile(file) {
+  var rd = document.getElementById('sl-result');
+  rd.innerHTML = '<p style="font-size:12px;color:var(--text3)">讀取中…</p>';
+  document.getElementById('sl-confirm').style.display = 'none';
+
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      var wb = XLSX.read(e.target.result, {type:'array'});
+      var allShots = [];
+      var warnings = [];
+
+      // Try each sheet to find Shotcode column
+      wb.SheetNames.forEach(function(sheetName) {
+        var ws = wb.Sheets[sheetName];
+        var rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
+        if(rows.length < 2) return;
+
+        // Find header row and Shotcode column
+        var headerRow = -1, shotcodeCol = -1;
+        for(var i=0; i<Math.min(5,rows.length); i++) {
+          for(var j=0; j<rows[i].length; j++) {
+            var cell = String(rows[i][j]||'').trim().toLowerCase();
+            if(cell === 'shotcode' || cell === 'shotcode ') {
+              headerRow = i; shotcodeCol = j; break;
+            }
+          }
+          if(headerRow >= 0) break;
+        }
+
+        if(shotcodeCol < 0) {
+          // Try to find column containing EP###_SEQ###_SH### pattern
+          for(var i=1; i<Math.min(10,rows.length); i++) {
+            for(var j=0; j<rows[i].length; j++) {
+              if(/EP\d+_SEQ\d+_SH\d+/i.test(String(rows[i][j]||''))) {
+                shotcodeCol = j; headerRow = i-1; break;
+              }
+            }
+            if(shotcodeCol >= 0) break;
+          }
+        }
+
+        if(shotcodeCol < 0) { warnings.push(sheetName+': 找不到 Shotcode 欄位，略過'); return; }
+
+        // Collect shot IDs
+        var sheetShots = [];
+        for(var i=headerRow+1; i<rows.length; i++) {
+          var val = String(rows[i][shotcodeCol]||'').trim();
+          if(!val) continue;
+          // Extract SH### part - support full EP_SEQ_SH format
+          var match = val.match(/SH\d+/i);
+          if(match) sheetShots.push(val.toUpperCase());
+        }
+        if(sheetShots.length) allShots = allShots.concat(sheetShots);
+        else warnings.push(sheetName+': 找不到有效卡號');
+      });
+
+      // Deduplicate
+      var seen = {};
+      var unique = allShots.filter(function(s){ if(seen[s]) return false; seen[s]=true; return true; });
+
+      if(!unique.length) {
+        rd.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 找不到 Shotcode 資料</div>';
+        return;
+      }
+
+      // Check which already exist in current episode
+      var ep = getE();
+      var existing = 0, newOnes = [];
+      unique.forEach(function(shotId) {
+        if(ep && ep.shots.find(function(s){return s.shotId===shotId;})) existing++;
+        else newOnes.push(shotId);
+      });
+
+      shotlistData = newOnes;
+      var html = '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">偵測結果：</div>';
+      html += '<div class="im-row ok"><i class="ti ti-check"></i> 共找到 '+unique.length+' 個卡號，將新增 '+newOnes.length+' 個</div>';
+      if(existing) html += '<div class="im-row warn"><i class="ti ti-info-circle"></i> '+existing+' 個已存在，略過</div>';
+      warnings.forEach(function(w){ html += '<div class="im-row warn"><i class="ti ti-alert-triangle"></i> '+esc(w)+'</div>'; });
+      html += '<div style="font-size:11px;color:var(--text3);margin-top:8px">匯入目標：'+esc(ep?ep.name:'未選擇集數')+'</div>';
+      rd.innerHTML = html;
+      if(newOnes.length > 0) document.getElementById('sl-confirm').style.display = 'inline-flex';
+
+    } catch(err) {
+      rd.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 讀取失敗：'+esc(err.message)+'</div>';
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function doImportShotlist() {
+  if(!shotlistData||!shotlistData.length) return;
+  var ep = getE(); if(!ep) return;
+  shotlistData.forEach(function(shotId){ ep.shots.push(mkShot(shotId)); });
+  persist(); closeShotlistModal(); renderContent();
+  alert('成功匯入 '+shotlistData.length+' 個卡號到 '+ep.name);
+}
+
+</script>
 <style>
 :root{
   --bg:#0f1117;--bg2:#181c27;--bg3:#1e2235;--bg4:#252a3e;
@@ -194,6 +674,7 @@ textarea.ci::placeholder{color:var(--text3)}
     <div class="sf">
       <button class="btn-ex" onclick="openExportModal('all')"><i class="ti ti-file-spreadsheet"></i>匯出全部 Excel</button>
       <button class="btn-im" onclick="openImportModal()"><i class="ti ti-file-upload"></i>匯入 Excel 備份</button>
+      <button class="btn-im" onclick="openShotlistModal()" style="border-color:rgba(62,207,207,.4);color:var(--teal)"><i class="ti ti-list-numbers"></i>從 Shotlist 匯入卡號</button>
     </div>
   </div>
   <div id="main">
@@ -264,6 +745,33 @@ textarea.ci::placeholder{color:var(--text3)}
     <div class="mb" style="margin-top:14px">
       <button class="bcl" onclick="closeImportModal()">取消</button>
       <button class="bco" id="im-confirm" style="display:none;background:var(--green)" onclick="doImport()">確認匯入</button>
+    </div>
+  </div>
+</div>
+
+
+<!-- SHOTLIST MODAL -->
+<div class="mo" id="shotlist-modal" style="display:none">
+  <div class="md" onclick="event.stopPropagation()" style="max-width:520px">
+    <h2 style="margin-bottom:4px"><i class="ti ti-list-numbers" style="color:var(--teal)"></i> 從 Shotlist 匯入卡號</h2>
+    <p style="font-size:12px;color:var(--text3);margin-bottom:10px">上傳 Shotlist Excel，系統自動讀取 Shotcode 欄位新增卡號到目前集數</p>
+    <div style="background:var(--bg3);border-radius:var(--r);padding:8px 12px;margin-bottom:12px;font-size:12px;color:var(--text2)">
+      <i class="ti ti-info-circle" style="color:var(--teal)"></i>
+      請先選擇要匯入的集數（頁籤），再點此功能
+    </div>
+    <div class="im-drop" id="sl-drop"
+      ondragover="event.preventDefault();this.classList.add('dv')"
+      ondragleave="this.classList.remove('dv')"
+      ondrop="onSlDrop(event)">
+      <i class="ti ti-table-import"></i>
+      <p style="font-size:13px;color:var(--text2)">拖曳 Shotlist Excel 至此 / 點擊選擇</p>
+      <small style="font-size:11px;color:var(--text3)">系統自動尋找 Shotcode 欄位</small>
+    </div>
+    <input type="file" id="sl-file" accept=".xlsx" style="display:none" onchange="onSlFile(this.files[0])">
+    <div class="im-result" id="sl-result"></div>
+    <div class="mb" style="margin-top:14px">
+      <button class="bcl" onclick="closeShotlistModal()">取消</button>
+      <button class="bco" id="sl-confirm" style="display:none;background:var(--teal)" onclick="doImportShotlist()">確認匯入卡號</button>
     </div>
   </div>
 </div>
@@ -668,10 +1176,20 @@ function doExport(appendOnly) {
   if(exportTarget==='ep') runExportEp(appendOnly);
   else runExportAll(appendOnly);
 }
+function shotHasContent(s) {
+  // returns true if any round has any feedback content
+  return (s.rounds||[]).some(function(r){
+    return (r.feedback&&r.feedback.trim()) ||
+           (r.dialogText&&r.dialogText.trim()) ||
+           r.onSite || r.walla;
+  });
+}
 function epRows(ep,appendOnly) {
   var rows=[['卡號','整體反饋','輪次','現場討論','台詞修改','台詞更改日期','Walla','Walla日期','追加完成']];
   ep.shots.slice().sort(function(a,b){return a.shotId.localeCompare(b.shotId,undefined,{numeric:true});})
   .forEach(function(s){
+    // skip shots with no content at all
+    if(!shotHasContent(s)) return;
     var rounds=s.rounds||[];
     var filtered=appendOnly?rounds.filter(function(_,i){return i>0;}):rounds;
     if(!filtered.length) return;
@@ -775,6 +1293,126 @@ function doImport() {
   persist(); closeImportModal(); renderSidebar(); selectP(p.id);
   alert('匯入完成！共匯入 '+importData.length+' 個集數');
 }
+
+/* ── SHOTLIST IMPORT ── */
+var shotlistData = null;
+
+function openShotlistModal() {
+  if(!getE()){ alert('請先選擇要匯入的集數（點擊上方頁籤選好集數再來操作）'); return; }
+  shotlistData = null;
+  document.getElementById('sl-result').innerHTML = '';
+  document.getElementById('sl-confirm').style.display = 'none';
+  document.getElementById('sl-file').value = '';
+  document.getElementById('shotlist-modal').style.display = 'flex';
+}
+function closeShotlistModal() { document.getElementById('shotlist-modal').style.display='none'; shotlistData=null; }
+document.getElementById('shotlist-modal').addEventListener('click',function(e){if(e.target===this) closeShotlistModal();});
+document.getElementById('sl-drop').addEventListener('click',function(){document.getElementById('sl-file').click();});
+
+function onSlDrop(e) {
+  e.preventDefault(); document.getElementById('sl-drop').classList.remove('dv');
+  var f=e.dataTransfer.files[0]; if(f) parseSlFile(f);
+}
+function onSlFile(f) { if(f) parseSlFile(f); }
+
+function parseSlFile(file) {
+  var rd = document.getElementById('sl-result');
+  rd.innerHTML = '<p style="font-size:12px;color:var(--text3)">讀取中…</p>';
+  document.getElementById('sl-confirm').style.display = 'none';
+
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      var wb = XLSX.read(e.target.result, {type:'array'});
+      var allShots = [];
+      var warnings = [];
+
+      // Try each sheet to find Shotcode column
+      wb.SheetNames.forEach(function(sheetName) {
+        var ws = wb.Sheets[sheetName];
+        var rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
+        if(rows.length < 2) return;
+
+        // Find header row and Shotcode column
+        var headerRow = -1, shotcodeCol = -1;
+        for(var i=0; i<Math.min(5,rows.length); i++) {
+          for(var j=0; j<rows[i].length; j++) {
+            var cell = String(rows[i][j]||'').trim().toLowerCase();
+            if(cell === 'shotcode' || cell === 'shotcode ') {
+              headerRow = i; shotcodeCol = j; break;
+            }
+          }
+          if(headerRow >= 0) break;
+        }
+
+        if(shotcodeCol < 0) {
+          // Try to find column containing EP###_SEQ###_SH### pattern
+          for(var i=1; i<Math.min(10,rows.length); i++) {
+            for(var j=0; j<rows[i].length; j++) {
+              if(/EP\d+_SEQ\d+_SH\d+/i.test(String(rows[i][j]||''))) {
+                shotcodeCol = j; headerRow = i-1; break;
+              }
+            }
+            if(shotcodeCol >= 0) break;
+          }
+        }
+
+        if(shotcodeCol < 0) { warnings.push(sheetName+': 找不到 Shotcode 欄位，略過'); return; }
+
+        // Collect shot IDs
+        var sheetShots = [];
+        for(var i=headerRow+1; i<rows.length; i++) {
+          var val = String(rows[i][shotcodeCol]||'').trim();
+          if(!val) continue;
+          // Extract SH### part - support full EP_SEQ_SH format
+          var match = val.match(/SH\d+/i);
+          if(match) sheetShots.push(val.toUpperCase());
+        }
+        if(sheetShots.length) allShots = allShots.concat(sheetShots);
+        else warnings.push(sheetName+': 找不到有效卡號');
+      });
+
+      // Deduplicate
+      var seen = {};
+      var unique = allShots.filter(function(s){ if(seen[s]) return false; seen[s]=true; return true; });
+
+      if(!unique.length) {
+        rd.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 找不到 Shotcode 資料</div>';
+        return;
+      }
+
+      // Check which already exist in current episode
+      var ep = getE();
+      var existing = 0, newOnes = [];
+      unique.forEach(function(shotId) {
+        if(ep && ep.shots.find(function(s){return s.shotId===shotId;})) existing++;
+        else newOnes.push(shotId);
+      });
+
+      shotlistData = newOnes;
+      var html = '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">偵測結果：</div>';
+      html += '<div class="im-row ok"><i class="ti ti-check"></i> 共找到 '+unique.length+' 個卡號，將新增 '+newOnes.length+' 個</div>';
+      if(existing) html += '<div class="im-row warn"><i class="ti ti-info-circle"></i> '+existing+' 個已存在，略過</div>';
+      warnings.forEach(function(w){ html += '<div class="im-row warn"><i class="ti ti-alert-triangle"></i> '+esc(w)+'</div>'; });
+      html += '<div style="font-size:11px;color:var(--text3);margin-top:8px">匯入目標：'+esc(ep?ep.name:'未選擇集數')+'</div>';
+      rd.innerHTML = html;
+      if(newOnes.length > 0) document.getElementById('sl-confirm').style.display = 'inline-flex';
+
+    } catch(err) {
+      rd.innerHTML = '<div class="im-row err"><i class="ti ti-alert-circle"></i> 讀取失敗：'+esc(err.message)+'</div>';
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function doImportShotlist() {
+  if(!shotlistData||!shotlistData.length) return;
+  var ep = getE(); if(!ep) return;
+  shotlistData.forEach(function(shotId){ ep.shots.push(mkShot(shotId)); });
+  persist(); closeShotlistModal(); renderContent();
+  alert('成功匯入 '+shotlistData.length+' 個卡號到 '+ep.name);
+}
+
 </script>
 </body>
 </html>
