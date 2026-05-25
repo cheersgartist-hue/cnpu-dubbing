@@ -1056,8 +1056,7 @@ function editP(id){
 }
 function delProject(id){
   var p=DB.projects.find(function(x){return x.id===id;}); if(!p) return;
-  if(!confirm('確定刪除專案「'+p.name+'」？
-此操作無法復原，專案內所有集數和卡號都會刪除。')) return;
+  if(!confirm('確定刪除專案「'+p.name+'」？\n此操作無法復原，專案內所有集數和卡號都會刪除。')) return;
   DB.projects=DB.projects.filter(function(x){return x.id!==id;});
   if(curPid===id){ curPid=null; curEid=null; showNoProj(); }
   persist(); renderSidebar();
